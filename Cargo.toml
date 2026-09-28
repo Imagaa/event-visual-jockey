@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["crates/evj-core", "crates/evj-media", "crates/evj-render", "crates/evj-audio", "crates/evj-present", "crates/evj-engine", "crates/evj-app"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+windows = "0.62.2"
+snap = "1.1"

@@ -1,0 +1,14 @@
+[package]
+name = "evj-present"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+evj-core = { path = "../evj-core" }
+windows = { workspace = true, features = [
+  "Foundation", "Foundation_Collections", "Data_Pdf", "Storage", "Storage_Streams", "Storage_Search", "Storage_FileProperties", "Win32_System_Com", "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+evj-media = { path = "../evj-media" }

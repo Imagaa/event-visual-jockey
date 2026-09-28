@@ -1,0 +1,12 @@
+[package]
+name = "evj-audio"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+anyhow.workspace = true
+rtrb = "0.4"
+cpal = "0.18"
+evj-core = { path = "../evj-core" }
+evj-media = { path = "../evj-media" }

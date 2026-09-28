@@ -1,0 +1,27 @@
+# Build output
+/target
+/dist
+*.bench.txt
+*.tmp
+
+# Large local media and third-party SDKs (tools/setup-ffmpeg-dev.ps1 downloads FFmpeg)
+/media
+/third_party
+/docs/bench
+
+# Original high-resolution logo (the app uses assets/)
+/EVJ-Logo.png
+
+# Claude / AI assistant working files
+/.superpowers
+/.claude
+/docs/superpowers
+CLAUDE.md
+CLAUDE.local.md
+
+# Editors and OS
+/.vs
+/.vscode
+/.idea
+Thumbs.db
+desktop.ini
