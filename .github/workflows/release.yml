@@ -62,7 +62,11 @@ jobs:
           $f = Get-Item dist/EVJ-Setup-*.exe
           "$((Get-FileHash $f -Algorithm SHA256).Hash.ToLower())  $($f.Name)" | Out-File -Encoding ascii "$($f.FullName).sha256"
           $notes = "docs/release-notes/$env:TAG.md"
-          if (-not (Test-Path $notes)) { "EVJ $env:TAG — Windows installer below." | Out-File -Encoding utf8 $notes }
+          if (-not (Test-Path $notes)) {
+            # Older tags have no notes file (or no docs/release-notes folder at all).
+            $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+            "EVJ $env:TAG — Windows installer below." | Out-File -Encoding utf8 $notes
+          }
           "NOTES=$notes" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: Publish the release
