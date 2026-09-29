@@ -1,0 +1,89 @@
+# Builds the Windows installer and publishes it as a GitHub release.
+# - Push a tag `vX.Y.Z` → the installer + its SHA-256 are attached to release vX.Y.Z (created or updated),
+#   with docs/release-notes/vX.Y.Z.md as the text, marked as the latest release.
+# - Run it by hand (Actions → Release → Run workflow) to rebuild a tag; untick "publish" to only build
+#   (the installer is then kept as a workflow artifact for 7 days).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build, e.g. v0.2.0'
+        required: true
+      publish:
+        description: 'Publish to the release (untick = build only)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  installer:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # build-installer.ps1 builds into its own target dir (the FFmpeg-enabled exe).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target/installer/build'
+
+      - name: Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build the installer (downloads the FFmpeg LGPL dev build)
+        shell: pwsh
+        run: ./tools/build-installer.ps1
+
+      - name: Version matches the tag
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:TAG) { throw "Cargo.toml says $version but the tag is $env:TAG" }
+
+      - name: Checksum and release text
+        shell: pwsh
+        run: |
+          $f = Get-Item dist/EVJ-Setup-*.exe
+          "$((Get-FileHash $f -Algorithm SHA256).Hash.ToLower())  $($f.Name)" | Out-File -Encoding ascii "$($f.FullName).sha256"
+          $notes = "docs/release-notes/$env:TAG.md"
+          if (-not (Test-Path $notes)) { "EVJ $env:TAG — Windows installer below." | Out-File -Encoding utf8 $notes }
+          "NOTES=$notes" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Publish the release
+        if: github.event_name == 'push' || inputs.publish
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          name: EVJ ${{ env.TAG }}
+          body_path: ${{ env.NOTES }}
+          files: |
+            dist/EVJ-Setup-*.exe
+            dist/EVJ-Setup-*.exe.sha256
+          fail_on_unmatched_files: true
+          make_latest: 'true'
+
+      - name: Keep the build (build-only runs)
+        if: github.event_name == 'workflow_dispatch' && !inputs.publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: EVJ-Setup-${{ env.TAG }}
+          path: |
+            dist/EVJ-Setup-*.exe
+            dist/EVJ-Setup-*.exe.sha256
+          retention-days: 7

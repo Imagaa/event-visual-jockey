@@ -13,7 +13,8 @@
 <p align="center">
   <a href="https://github.com/Imagaa/event-visual-jockey/releases/latest"><b>⬇ Download the installer</b></a> ·
   <a href="docs/USER-GUIDE.md">User guide (Bahasa Indonesia)</a> ·
-  <a href="docs/TESTING-CHECKLIST.md">Test checklist</a>
+  <a href="docs/TESTING-CHECKLIST.md">Test checklist</a> ·
+  <a href="docs/ROADMAP.md">Roadmap</a>
 </p>
 
 <p align="center">
@@ -156,5 +157,7 @@ Command line: `evj [show.vjproj | clip …]`, `evj --bench SECONDS show.vjproj`,
 ## Status
 
 **v0.2.0 — pre-release.** Built and automatically tested (300+ tests), used on a real event; the manual checklist in `docs/TESTING-CHECKLIST.md` is the sign-off before your own show. Feedback and issues are welcome.
+
+Planned next (output mapping, an updater, smaller items): [docs/ROADMAP.md](docs/ROADMAP.md). How releases are built and published: [docs/RELEASING.md](docs/RELEASING.md).
 
 FFmpeg is used under the LGPL; its license is installed next to EVJ.
