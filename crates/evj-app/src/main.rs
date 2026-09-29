@@ -1,5 +1,8 @@
 //! EVJ — show-control visuals. `evj [--bench SECONDS | --soak HOURS] [--output MONITOR] [project.vjproj | clip...]`
+// Release builds are a window app: no console window next to EVJ (see `attach_console`).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod audioset;
+mod chain;
 mod crash;
 mod dialogs;
 mod dock;
@@ -7,12 +10,12 @@ mod fxui;
 mod jobs;
 mod lock;
 mod meters;
+mod modal;
 mod outputs;
 mod outui;
 mod present;
 mod shortcuts;
 mod preview;
-mod sequence;
 mod soak;
 mod thumbs;
 mod timeline;
@@ -125,6 +128,51 @@ struct UiWin {
     egui_rend: egui_directx11::Renderer,
     /// Last present reached the screen; a minimised / covered window is paced by a timer instead.
     visible: bool,
+    /// Frame timing of this window (ms): the bench prints it.
+    times: UiTimes,
+}
+
+/// UI frame timing: interval between frames, time waiting for the swapchain, building the egui
+/// frame (`draw`), and render + present.
+#[derive(Default)]
+struct UiTimes {
+    interval: evj_engine::stats::FrameStats,
+    wait: evj_engine::stats::FrameStats,
+    draw: evj_engine::stats::FrameStats,
+    lock: evj_engine::stats::FrameStats,
+    render: evj_engine::stats::FrameStats,
+    present: evj_engine::stats::FrameStats,
+    last: Option<Instant>,
+}
+
+impl UiTimes {
+    /// The moments of one frame: start, after the swapchain wait, after `draw`, after locking the
+    /// shared previews, after the egui render, after present.
+    fn record(&mut self, t: [Instant; 6]) {
+        let ms = |a: Instant, b: Instant| (b - a).as_secs_f32() * 1000.0;
+        if let Some(last) = self.last {
+            self.interval.record(ms(last, t[1]), 1000.0 / 60.0);
+        }
+        self.last = Some(t[1]);
+        for (i, s) in [&mut self.wait, &mut self.draw, &mut self.lock, &mut self.render, &mut self.present].into_iter().enumerate() {
+            s.record(ms(t[i], t[i + 1]), f32::MAX);
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = UiTimes::default();
+    }
+
+    fn report(&self) -> String {
+        let row = |name: &str, s: &evj_engine::stats::FrameStats| format!("ui {name}: median {:.2} ms, p99 {:.2} ms\n", s.recent_percentile(50.0), s.recent_percentile(99.0));
+        format!("ui fps: {:.1}\nui slow frames: {}\n", self.interval.recent_fps(), self.interval.dropped)
+            + &row("interval", &self.interval)
+            + &row("wait", &self.wait)
+            + &row("draw", &self.draw)
+            + &row("preview lock", &self.lock)
+            + &row("render", &self.render)
+            + &row("present", &self.present)
+    }
 }
 
 impl UiWin {
@@ -132,14 +180,16 @@ impl UiWin {
         let window = el.create_window(attrs.with_window_icon(window_icon()))?;
         let size = window.inner_size();
         let chain = Swapchain::new(gpu, HWND(hwnd(&window)? as _), size.width, size.height)?;
+        chain.set_max_latency(2)?;
         let egui_ctx = egui::Context::default();
         let egui_winit = egui_winit::State::new(egui_ctx.clone(), egui_ctx.viewport_id(), &window, None, None, None);
         let egui_rend = egui_directx11::Renderer::new(&gpu.device)?;
-        Ok(UiWin { window, chain, egui_ctx, egui_winit, egui_rend, visible: true })
+        Ok(UiWin { window, chain, egui_ctx, egui_winit, egui_rend, visible: true, times: UiTimes::default() })
     }
 
     /// One egui frame, presented. `shared` previews are held (keyed mutex) while they are drawn.
     fn frame(&mut self, gpu: &Gpu, shared: &[Option<&Preview>], run: impl FnMut(&mut egui::Ui)) -> Result<()> {
+        let start = Instant::now();
         if self.visible {
             self.chain.wait();
         } else {
@@ -147,18 +197,23 @@ impl UiWin {
             std::thread::sleep(Duration::from_millis(15));
         }
         let Some(rtv) = self.chain.rtv().cloned() else { return Ok(()) };
+        let waited = Instant::now();
         let input = self.egui_winit.take_egui_input(&self.window);
         let out = self.egui_ctx.run_ui(input, run);
+        let drawn = Instant::now();
         let (renderer_output, platform_output, _) = egui_directx11::split_output(out);
         self.egui_winit.handle_platform_output(&self.window, platform_output);
         unsafe { gpu.ctx.ClearRenderTargetView(&rtv, &[0.05, 0.05, 0.06, 1.0]) };
         let held: Vec<&Preview> = shared.iter().flatten().copied().filter(|p| p.lock()).collect();
+        let locked = Instant::now();
         let r = self.egui_rend.render(&gpu.ctx, &rtv, &self.egui_ctx, renderer_output);
         for p in held {
             p.unlock();
         }
         r?;
+        let rendered = Instant::now();
         self.visible = self.chain.present()?;
+        self.times.record([start, waited, drawn, locked, rendered, Instant::now()]);
         Ok(())
     }
 }
@@ -236,9 +291,9 @@ impl App {
         self.open_preview()?;
         let (tx, rx) = channel();
         self.engine.send(Command::ShareTransitionPreview(tx));
-        let (handle, w, h) = rx.recv_timeout(Duration::from_secs(5))??;
+        let shared = rx.recv_timeout(Duration::from_secs(5))??;
         if let Some(win) = self.ui.as_mut() {
-            self.tr_preview = Some(Preview::open(&self.gpu, &mut win.egui_rend, handle, w, h)?);
+            self.tr_preview = Some(Preview::open(&self.gpu, &mut win.egui_rend, &shared)?);
         }
         self.open_cue_preview()
     }
@@ -246,24 +301,24 @@ impl App {
     fn open_preview(&mut self) -> Result<()> {
         let Some(win) = self.ui.as_mut() else { return Ok(()) };
         if let Some(old) = self.preview.take() {
-            win.egui_rend.unregister_user_texture(old.tex_id);
+            old.release(&mut win.egui_rend);
         }
         let (tx, rx) = channel();
         self.engine.send(Command::SharePreview(tx));
-        let (handle, w, h) = rx.recv_timeout(Duration::from_secs(5))??;
-        self.preview = Some(Preview::open(&self.gpu, &mut win.egui_rend, handle, w, h)?);
+        let shared = rx.recv_timeout(Duration::from_secs(5))??;
+        self.preview = Some(Preview::open(&self.gpu, &mut win.egui_rend, &shared)?);
         Ok(())
     }
 
     fn open_cue_preview(&mut self) -> Result<()> {
         let Some(win) = self.ui.as_mut() else { return Ok(()) };
         if let Some(old) = self.cue_preview.take() {
-            win.egui_rend.unregister_user_texture(old.tex_id);
+            old.release(&mut win.egui_rend);
         }
         let (tx, rx) = channel();
         self.engine.send(Command::ShareCuePreview(tx));
-        let (handle, w, h) = rx.recv_timeout(Duration::from_secs(5))??;
-        self.cue_preview = Some(Preview::open(&self.gpu, &mut win.egui_rend, handle, w, h)?);
+        let shared = rx.recv_timeout(Duration::from_secs(5))??;
+        self.cue_preview = Some(Preview::open(&self.gpu, &mut win.egui_rend, &shared)?);
         self.state.cue_sent = None; // the engine forgot the cue with its old texture: send it again
         Ok(())
     }
@@ -271,12 +326,12 @@ impl App {
     fn open_tr_preview(&mut self) -> Result<()> {
         let Some(win) = self.ui.as_mut() else { return Ok(()) };
         if let Some(old) = self.tr_preview.take() {
-            win.egui_rend.unregister_user_texture(old.tex_id);
+            old.release(&mut win.egui_rend);
         }
         let (tx, rx) = channel();
         self.engine.send(Command::ShareTransitionPreview(tx));
-        let (handle, w, h) = rx.recv_timeout(Duration::from_secs(5))??;
-        self.tr_preview = Some(Preview::open(&self.gpu, &mut win.egui_rend, handle, w, h)?);
+        let shared = rx.recv_timeout(Duration::from_secs(5))??;
+        self.tr_preview = Some(Preview::open(&self.gpu, &mut win.egui_rend, &shared)?);
         Ok(())
     }
 
@@ -297,18 +352,18 @@ impl App {
         if reopen || p.live.is_none() {
             // (Re)opens the shared output picture on this window's renderer.
             if let Some(old) = p.live.take() {
-                p.win.egui_rend.unregister_user_texture(old.tex_id);
+                old.release(&mut p.win.egui_rend);
             }
             // The same texture as the main preview (asking the engine again would replace it).
             if let Some(main) = self.preview.as_ref() {
-                p.live = Preview::open(&self.gpu, &mut p.win.egui_rend, main.handle, main.size[0] as u32, main.size[1] as u32).ok();
+                p.live = Preview::open(&self.gpu, &mut p.win.egui_rend, &main.shared).ok();
             }
         }
         if p.last.elapsed() < Duration::from_millis(33) {
             return Ok(());
         }
         p.last = Instant::now();
-        let live = p.live.as_ref().map(|l| (l.tex_id, l.size));
+        let live = p.live.as_ref().map(|l| (l.tex_id(), l.size));
         let mut act = Actions::default();
         let (state, images) = (&mut self.state, &mut p.images);
         p.win.frame(&self.gpu, &[p.live.as_ref()], |ui| present::presenter(ui, state, snap, live, images, &mut act))?;
@@ -409,11 +464,17 @@ impl App {
 
     fn open_project(&mut self, path: &Path, act: &mut Actions) {
         match io::load(path) {
-            Ok(p) => {
+            Ok(mut p) => {
+                // Older shows: Layer 1 becomes the top layer, sequences become scene chains.
+                let migrated = p.migrate();
                 self.remember(path);
                 self.state.replace_project(p, Some(path.to_path_buf()), act);
                 self.state.missing = io::missing_media(&self.state.project);
                 self.state.status = format!("Opened {}", path.display());
+                if migrated {
+                    self.state.dirty = true;
+                    self.state.status = format!("Opened {} — updated for this version (Layer 1 is now the top layer; sequences are scene chains)", path.display());
+                }
                 // Older shows: the Materi list moves into the grid.
                 if self.state.project.migrate_materi() {
                     self.state.dirty = true;
@@ -645,9 +706,9 @@ impl App {
         let Some(win) = self.ui.as_mut() else { return Ok(()) };
         self.thumbs.poll(&win.egui_ctx);
         self.waves.poll();
-        let preview = self.preview.as_ref().map(|p| (p.tex_id, p.size));
-        let tr_preview = self.tr_preview.as_ref().map(|p| (p.tex_id, p.size));
-        let cue_preview = self.cue_preview.as_ref().map(|p| (p.tex_id, p.size));
+        let preview = self.preview.as_ref().map(|p| (p.tex_id(), p.size));
+        let tr_preview = self.tr_preview.as_ref().map(|p| (p.tex_id(), p.size));
+        let cue_preview = self.cue_preview.as_ref().map(|p| (p.tex_id(), p.size));
         let mut act = Actions::default();
         let (state, thumbs, waves, out_previews) = (&mut self.state, &mut self.thumbs, &mut self.waves, &self.out_previews);
         win.frame(&self.gpu, &[self.preview.as_ref(), self.tr_preview.as_ref(), self.cue_preview.as_ref()], |ui| {
@@ -728,8 +789,8 @@ impl App {
                 Err(e) => format!("Cannot convert: {e}"),
             };
         }
-        let layout = dock::to_json(&self.state.layout);
-        if self.layout_gate.due(&layout, self.launched.elapsed().as_secs_f64()) {
+        let now = self.launched.elapsed().as_secs_f64();
+        if self.layout_gate.rested(now) && self.layout_gate.due(&dock::to_json(&self.state.layout), now) {
             if let Some(f) = shortcuts::settings_file() {
                 dock::save(&f, &self.state.layout);
             }
@@ -762,6 +823,9 @@ impl App {
             self.engine.send(Command::ResetStats);
             self.bench_reset = true;
             self.bench_cpu = Some((soak::process_cpu_time(), Instant::now()));
+            if let Some(w) = self.ui.as_mut() {
+                w.times.reset();
+            }
         }
         if t > secs + WARMUP {
             let s = self.engine.snapshot();
@@ -780,6 +844,9 @@ impl App {
             }
             for (name, ms) in &s.gpu_stages {
                 r += &format!("gpu {name}: {ms:.2} ms\n");
+            }
+            if let Some(w) = &self.ui {
+                r += &w.times.report();
             }
             println!("{r}");
             let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -813,7 +880,11 @@ impl App {
             Some(p) if p.extension().is_some_and(|e| e == io::EXTENSION) => {
                 self.open_project(p, &mut act);
                 if self.args.bench.is_some() {
-                    self.state.trigger_column(0, &mut act); // the bench scenario is column 1
+                    // The bench scenario: column 1 on Program, layer 1 of column 2 on Preview.
+                    self.state.trigger_column(0, &mut act);
+                    if self.state.project.deck().and_then(|d| d.clip(0, 1)).is_some() {
+                        self.state.selected = ui::Selection::Slot(0, 1);
+                    }
                 }
             }
             Some(_) => {
@@ -957,7 +1028,38 @@ impl ApplicationHandler for App {
     }
 }
 
-fn main() -> Result<()> {
+/// Started from a terminal (`evj --bench 10`): print there. Started from the Start menu / a
+/// shortcut there is no parent console and nothing happens.
+fn attach_console() {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: plain Win32 call without pointers; failing (no parent console) is fine.
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+fn main() -> std::process::ExitCode {
+    attach_console();
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // No console in release builds: say it in a message box (and the log), not only on stderr.
+            evj_core::log::error("app", &format!("could not run: {e:#}"));
+            eprintln!("EVJ: {e:#}");
+            fatal_box(&format!("{e:#}"));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn fatal_box(text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    use windows::core::HSTRING;
+    // SAFETY: both strings live across the (modal) call.
+    unsafe { MessageBoxW(None, &HSTRING::from(format!("EVJ could not start or stopped:
+
+{text}")), &HSTRING::from("EVJ"), MB_OK | MB_ICONERROR) };
+}
+
+fn run() -> Result<()> {
     let launched = Instant::now();
     let args = parse_args()?;
     if let Some(dir) = io::app_dir() {
@@ -977,6 +1079,10 @@ fn main() -> Result<()> {
     })?;
     // Separate device for the UI: nothing it does can stall the engine's GPU context.
     let gpu = Gpu::new(DeviceKind::Hardware)?;
+    // The audience's picture first: the operator's window waits when the GPU is busy.
+    if let Err(e) = gpu.set_priority(-7) {
+        evj_core::log::warn("app", &format!("UI GPU priority: {e:#}"));
+    }
     let mut app = App {
         args,
         gpu,

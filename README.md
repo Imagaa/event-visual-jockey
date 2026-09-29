@@ -16,6 +16,10 @@
   <a href="docs/TESTING-CHECKLIST.md">Test checklist</a>
 </p>
 
+<p align="center">
+  <img src="docs/screenshots/live.png" alt="EVJ in the Live layout: clip grid with scene and layer chains, PROGRAM playing a keynote slide with a lower third, PREVIEW with the clip timeline" width="100%">
+</p>
+
 ---
 
 ## Why EVJ
@@ -23,7 +27,7 @@
 At a real event the operator juggles a VJ tool for the LED screen, PowerPoint for the speakers, a media player for the walk-in music and a lot of Alt+Tab. EVJ puts all of it in **one window, on one render engine**, so nothing else has to open during the show:
 
 - **Live-safe by design** — PROGRAM / PREVIEW like a broadcast switcher, a 🔒 lock for the live part, BLACKOUT and PANIC always one key away, autosave and crash recovery.
-- **Fast on ordinary laptops** — native Rust + Direct3D 11, HAP GPU decoding, hardware H.264, tested on a Ryzen 7 5700U with integrated Vega 8 graphics.
+- **Fast on ordinary laptops** — native Rust + Direct3D 11, HAP GPU decoding, hardware H.264, tested on a Ryzen 7 5700U with integrated Vega 8 graphics: the operator's monitors run at ~60 fps while the audience's output keeps GPU priority.
 - **Presentations without PowerPoint on stage** — PPTX / PDF are imported once (slides, click animations, embedded video, speaker notes) and then play from the grid with clicker and laser-pointer support.
 - **Offline, no account, no subscription.**
 
@@ -34,7 +38,8 @@ At a real event the operator juggles a VJ tool for the LED screen, PowerPoint fo
 - Drag files or whole folders from Explorer; thumbnails and durations on every slot.
 - **1 click = PREVIEW, double-click = PROGRAM**, TAKE (Enter) to put the preview live.
 - **Scenes**: click a column header to preview the whole column blended, double-click to go live, rename it ("Opening", "Keynote" …).
-- **Sequences**: Shift+click slots → *Make sequence* → they play one after another **without a gap**, stills timed, loop the whole sequence, ⏭ Next.
+- **Chains**: layers of one scene start one after another (after the previous ends or after N seconds, replacing or overlaying it), and scenes play one after another when their longest clip ends — each chain stops at the end or loops, ⏭ Next.
+- **Layer 1 on top**, ⏶ / ⏷ to reorder layers, delete layers and scenes (right-click); every image has its own duration with a countdown like video.
 - Keyboard mapping for slots, scenes and layers; ✔ marks for clips that have been on air.
 
 ### Per-clip timeline
@@ -48,7 +53,8 @@ At a real event the operator juggles a VJ tool for the LED screen, PowerPoint fo
 - Loop, ping-pong, once, reverse, speed, BPM sync. **Convert to HAP** built in.
 
 ### Effects, BPM and transitions
-- 16 built-in GPU effects on clips, layers and the composition; every parameter can follow an **LFO** synced to the BPM (tap tempo, nudge, resync).
+- 17 built-in GPU effects on clips, layers and the composition; every parameter can follow an **LFO** synced to the BPM (tap tempo, nudge, resync).
+- **Chroma Key with an eyedropper**: press *Pick* and click the colour on the Preview or Program monitor — green / blue screens (shadows included, spill suppression for edges) or plain white / black backgrounds of logos, on images and videos.
 - 10 blend modes, opacity, bypass / solo per layer.
 - 12 transitions (crossfade, wipes, dip to black …) with a Transition Manager: presets, durations in seconds or beats, easing, favourites.
 - Your own effects: drop an `.hlsl` file into the `effects` folder — hot-reloaded.
@@ -72,12 +78,17 @@ At a real event the operator juggles a VJ tool for the LED screen, PowerPoint fo
 ### Operator comfort and safety
 - **Modular panels**: every part of the window is a dockable tab (drag, split, float, close) with View menu, *Live* / *Setup* layouts, remembered per laptop.
 - **LOCK LIVE** keeps show control but blocks anything destructive (adding / removing media, effects editing, layout changes).
-- Countdown of every layer on air (red and blinking in the last 10 s), dB meters, frame-time monitor.
+- Countdown of every layer on air with milliseconds (red and blinking in the last 10 s before a clip ends), dB meters, frame-time monitor.
+- Questions (delete, quit, unsaved changes, recover) as clear dialogs: Enter confirms, Esc cancels — and never trigger TAKE by accident.
 - App-wide, customisable shortcuts; welcome screen with recent shows; autosave every 60 s + recovery after a crash; unsaved-changes prompts.
+
+<p align="center">
+  <img src="docs/screenshots/chroma-key.png" alt="Chroma Key: a green-screen presenter keyed over a video background, with the key colour, Pick, tolerance, softness and spill in the clip settings" width="100%">
+</p>
 
 ## Getting started
 
-1. **Download** `EVJ-Setup-0.1.0.exe` from the [latest release](https://github.com/Imagaa/event-visual-jockey/releases/latest) and run it (Windows 10 / 11, 64-bit). No admin rights needed.
+1. **Download** `EVJ-Setup-0.2.0.exe` from the [latest release](https://github.com/Imagaa/event-visual-jockey/releases/latest) and run it (Windows 10 / 11, 64-bit). No admin rights needed.
 2. Start EVJ → **New show**.
 3. Drag videos, images, music or a PowerPoint / PDF onto the grid.
 4. Click a clip to see it on **PREVIEW**, press **Enter** (TAKE) or double-click to put it on **PROGRAM**.
@@ -93,7 +104,7 @@ The full guide (Bahasa Indonesia) is in [docs/USER-GUIDE.md](docs/USER-GUIDE.md)
 | Enter / Shift+Enter | TAKE (Preview → Program) / clear Program |
 | Space / Shift+Space | Preview play-pause / back to start |
 | B / F12 | BLACKOUT / PANIC |
-| I / O / N | Timeline start / end, next clip in a sequence |
+| I / O / N | Timeline start / end, next step / scene of a chain |
 | Ctrl+S, Ctrl+O, Ctrl+N | Save, open, new show |
 | Ctrl+Shift+L | Lock live |
 | T | Tap tempo |
@@ -132,18 +143,18 @@ The FFmpeg fallback decoder (`--features evj-app/ffmpeg`) needs LLVM and the FFm
 
 | Crate | Role |
 |---|---|
-| `evj-core` | Show model, file I/O, keymap, tempo / LFO, effects metadata, transitions, outputs, slide decks, sequences |
+| `evj-core` | Show model, file I/O, keymap, tempo / LFO, effects metadata, transitions, outputs, slide decks, chains |
 | `evj-media` | MOV parser + HAP decoder, Media Foundation video / audio, images, FFmpeg fallback, Convert to HAP |
 | `evj-render` | D3D11 device, textures, compositor (10 blend modes), effect runner, swap chains |
 | `evj-audio` | Real-time mixer, WASAPI outputs (device + channel routes) |
 | `evj-present` | PDF and PPTX import (`evj-import.exe`) |
-| `evj-engine` | Render thread: layers, sequences, seek, transitions, effects, outputs, presentations, Program / Preview audio |
+| `evj-engine` | Render thread: layers, queued clips, seek, transitions, effects, outputs, presentations, Program / Preview audio |
 | `evj-app` | `evj.exe`: dockable operator UI, output windows, presenter view, clicker, `--bench`, `--soak` |
 
 Command line: `evj [show.vjproj | clip …]`, `evj --bench SECONDS show.vjproj`, `evj --soak HOURS show.vjproj`, `evj --output MONITOR …`.
 
 ## Status
 
-**v0.1.0 — first public pre-release.** Built and automatically tested (260+ tests), used on a real event; the manual checklist in `docs/TESTING-CHECKLIST.md` is the sign-off before your own show. Feedback and issues are welcome.
+**v0.2.0 — pre-release.** Built and automatically tested (300+ tests), used on a real event; the manual checklist in `docs/TESTING-CHECKLIST.md` is the sign-off before your own show. Feedback and issues are welcome.
 
 FFmpeg is used under the LGPL; its license is installed next to EVJ.

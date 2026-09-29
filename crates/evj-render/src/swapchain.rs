@@ -51,6 +51,13 @@ impl Swapchain {
         Ok(())
     }
 
+    /// How many frames may wait for the screen. 1 = lowest latency (outputs); a window that
+    /// DWM composites needs 2, or every frame waits two vblanks (30 fps on a 60 Hz screen).
+    pub fn set_max_latency(&self, frames: u32) -> Result<()> {
+        unsafe { self.chain.SetMaximumFrameLatency(frames)? };
+        Ok(())
+    }
+
     /// Blocks until the swapchain can take a new frame.
     pub fn wait(&self) {
         unsafe { WaitForSingleObjectEx(self.waitable, 1000, true) };

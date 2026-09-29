@@ -30,6 +30,11 @@ impl KeyMap {
         self.bindings.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, a)| a)
     }
 
+    /// Rewrites every binding's action; None drops the binding.
+    pub fn remap(&mut self, f: impl Fn(&Action) -> Option<Action>) {
+        self.bindings = std::mem::take(&mut self.bindings).into_iter().filter_map(|(k, a)| f(&a).map(|a| (k, a))).collect();
+    }
+
     pub fn key_for(&self, action: &Action) -> Option<&str> {
         self.bindings.iter().find(|(_, a)| a == action).map(|(k, _)| k.as_str())
     }

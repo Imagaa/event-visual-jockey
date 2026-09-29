@@ -58,15 +58,15 @@ fn image_fills_composition() {
 #[test]
 fn opacity_mixes_layers_and_clear_removes() {
     let e = engine();
-    e.send(Command::Trigger { layer: 0, clip: stretch("blue_36x64.jpg"), transition: None });
-    e.send(Command::Trigger { layer: 1, clip: stretch("red_64x36.png"), transition: None });
-    e.send(Command::SetLayer { layer: 1, props: Layer { opacity: 0.5, ..Layer::default() } });
-    step_until(&e, 0.016, |s| s.layers[0].has_frame && s.layers[1].has_frame);
+    e.send(Command::Trigger { layer: 1, clip: stretch("blue_36x64.jpg"), transition: None });
+    e.send(Command::Trigger { layer: 0, clip: stretch("red_64x36.png"), transition: None });
+    e.send(Command::SetLayer { layer: 0, props: Layer { opacity: 0.5, ..Layer::default() } });
+    step_until(&e, 0.016, |s| s.layers[1].has_frame && s.layers[0].has_frame);
     e.step(0.016);
     let c = centre(&pixels(&e));
     assert!((c[0] as i32 - 127).abs() < 8 && (c[2] as i32 - 127).abs() < 12, "{c:?}");
 
-    e.send(Command::Clear { layer: 1, transition: None });
+    e.send(Command::Clear { layer: 0, transition: None });
     e.step(0.016);
     let c = centre(&pixels(&e));
     assert!(c[0] < 10 && c[2] > 240, "{c:?}");
@@ -76,16 +76,16 @@ fn opacity_mixes_layers_and_clear_removes() {
 #[test]
 fn bypass_and_solo() {
     let e = engine();
-    e.send(Command::Trigger { layer: 0, clip: stretch("blue_36x64.jpg"), transition: None });
-    e.send(Command::Trigger { layer: 1, clip: stretch("red_64x36.png"), transition: None });
-    step_until(&e, 0.016, |s| s.layers[0].has_frame && s.layers[1].has_frame);
+    e.send(Command::Trigger { layer: 1, clip: stretch("blue_36x64.jpg"), transition: None });
+    e.send(Command::Trigger { layer: 0, clip: stretch("red_64x36.png"), transition: None });
+    step_until(&e, 0.016, |s| s.layers[1].has_frame && s.layers[0].has_frame);
 
-    e.send(Command::SetLayer { layer: 1, props: Layer { bypass: true, ..Layer::default() } });
+    e.send(Command::SetLayer { layer: 0, props: Layer { bypass: true, ..Layer::default() } });
     e.step(0.016);
     assert!(centre(&pixels(&e))[2] > 240, "bypassed red layer must not show");
 
-    e.send(Command::SetLayer { layer: 1, props: Layer::default() });
-    e.send(Command::SetLayer { layer: 0, props: Layer { solo: true, blend: BlendMode::Alpha, ..Layer::default() } });
+    e.send(Command::SetLayer { layer: 0, props: Layer::default() });
+    e.send(Command::SetLayer { layer: 1, props: Layer { solo: true, blend: BlendMode::Alpha, ..Layer::default() } });
     e.step(0.016);
     assert!(centre(&pixels(&e))[2] > 240, "only the solo (blue) layer shows");
     e.shutdown().unwrap();
@@ -140,6 +140,25 @@ fn resolution_can_change_at_runtime() {
     assert_eq!(px.len(), 12 * 3 * 4);
     assert!(px.chunks(4).all(|p| p[0] > 250), "clip re-rendered at the new size");
     assert_eq!(e.snapshot().resolution, (12, 3));
+    e.shutdown().unwrap();
+}
+
+#[test]
+fn the_preview_rotates_so_the_ui_draws_a_finished_frame() {
+    let e = engine();
+    e.send(Command::Trigger { layer: 0, clip: stretch("red_64x36.png"), transition: None });
+    let (tx, rx) = channel();
+    e.send(Command::SharePreview(tx));
+    e.step(0.0);
+    let shared = rx.recv().unwrap().unwrap();
+    assert_eq!(shared.handles.len(), 3);
+    assert!(shared.handles.iter().all(|h| *h != 0));
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..6 {
+        e.step(0.016);
+        seen.insert(shared.ready.load(std::sync::atomic::Ordering::Acquire));
+    }
+    assert!(seen.len() >= 2, "the UI is handed a new slot as frames finish: {seen:?}");
     e.shutdown().unwrap();
 }
 
@@ -279,7 +298,8 @@ fn transition_preview_renders_while_selected() {
     let e = engine();
     let (tx, rx) = channel();
     e.send(Command::ShareTransitionPreview(tx));
-    let (_, w, h) = rx.recv().unwrap().unwrap();
+    let sp = rx.recv().unwrap().unwrap();
+    let (w, h) = (sp.width, sp.height);
     assert!(w > 0 && h > 0);
     e.send(Command::PreviewTransition(Some("Crossfade".into())));
     e.step(0.1);
@@ -350,11 +370,11 @@ fn output_can_show_a_single_layer_or_a_test_pattern() {
     step_until(&e, 0.016, |s| s.layers[0].has_frame && s.layers[1].has_frame);
     e.step(0.016);
     let comp = output_pixels(&e, OutputConfig::default());
-    assert!(comp[2] > 200, "composition: blue on top");
-    let layer0 = output_pixels(&e, OutputConfig { source: OutputSource::Layer(0), ..OutputConfig::default() });
+    assert!(comp[0] > 200, "composition: layer 1 (red) on top");
+    let layer1 = output_pixels(&e, OutputConfig { source: OutputSource::Layer(1), ..OutputConfig::default() });
     e.step(0.016); // layer taps are captured while rendering
-    let layer0 = if layer0[0] > 200 { layer0 } else { output_pixels(&e, OutputConfig { source: OutputSource::Layer(0), ..OutputConfig::default() }) };
-    assert!(layer0[0] > 200 && layer0[2] < 60, "layer 1 alone is red: {:?}", &layer0[..4]);
+    let layer1 = if layer1[2] > 200 { layer1 } else { output_pixels(&e, OutputConfig { source: OutputSource::Layer(1), ..OutputConfig::default() }) };
+    assert!(layer1[2] > 200 && layer1[0] < 60, "layer 2 alone is blue: {:?}", &layer1[..4]);
     let tp = output_pixels(&e, OutputConfig { test_pattern: true, ..OutputConfig::default() });
     assert_ne!(tp, comp);
     e.shutdown().unwrap();
@@ -366,7 +386,8 @@ fn cued_clip_shows_on_preview_only() {
     let (tx, rx) = channel();
     e.send(Command::ShareCuePreview(tx));
     e.step(0.0);
-    let (_, w, h) = rx.recv().unwrap().unwrap();
+    let sp = rx.recv().unwrap().unwrap();
+    let (w, h) = (sp.width, sp.height);
     assert_eq!((w, h), (640, 320), "composition aspect (8:4)");
     e.send(Command::CueClip(Some(stretch("red_64x36.png"))));
     let s = step_until(&e, 0.016, |s| s.cue.is_some());
@@ -389,10 +410,10 @@ fn layer_effects_blend_straight_onto_the_composition() {
     identity.param_mut("amount", 0.0).value = 0.0;
     for (blend, want) in [(BlendMode::Screen, [255, 0, 128]), (BlendMode::Multiply, [128, 0, 0]), (BlendMode::Alpha, [128, 0, 128])] {
         let e = engine();
-        e.send(Command::Trigger { layer: 0, clip: stretch("red_64x36.png"), transition: None });
-        e.send(Command::Trigger { layer: 1, clip: stretch("blue_36x64.jpg"), transition: None });
-        e.send(Command::SetLayer { layer: 1, props: Layer { blend, opacity: 0.5, effects: vec![identity.clone()], ..Layer::default() } });
-        step_until(&e, 0.016, |s| s.layers[0].has_frame && s.layers[1].has_frame);
+        e.send(Command::Trigger { layer: 1, clip: stretch("red_64x36.png"), transition: None });
+        e.send(Command::Trigger { layer: 0, clip: stretch("blue_36x64.jpg"), transition: None });
+        e.send(Command::SetLayer { layer: 0, props: Layer { blend, opacity: 0.5, effects: vec![identity.clone()], ..Layer::default() } });
+        step_until(&e, 0.016, |s| s.layers[1].has_frame && s.layers[0].has_frame);
         e.step(0.016);
         let px = output_pixels(&e, evj_core::output::OutputConfig::default());
         for c in 0..3 {
@@ -717,14 +738,62 @@ fn h264_in_and_out_points_are_honoured() {
 }
 
 #[test]
-fn still_image_with_a_duration_finishes() {
+fn images_count_down_and_keep_their_picture() {
     let e = engine();
-    let clip = Clip { still_secs: Some(0.1), ..stretch("red_64x36.png") };
+    let clip = Clip { mode: PlayMode::Once, still_secs: Some(0.2), ..stretch("red_64x36.png") };
     e.send(Command::Trigger { layer: 0, clip, transition: None });
     let s = step_until(&e, 0.0, showing(0));
     assert!(!s.layers[0].finished);
-    assert!(s.layers[0].remaining.is_some_and(|r| r <= 0.1));
-    step_until(&e, 0.02, |s| s.layers[0].finished);
+    assert!((s.layers[0].duration - 0.2).abs() < 1e-9, "{}", s.layers[0].duration);
+    assert!(s.layers[0].remaining.is_some_and(|r| r <= 0.2));
+    let s = step_until(&e, 0.05, |s| s.layers[0].finished);
+    assert!(s.layers[0].has_frame, "the picture stays after its time");
+    let looping = Clip { mode: PlayMode::Loop, still_secs: Some(0.2), ..stretch("blue_36x64.jpg") };
+    e.send(Command::Trigger { layer: 1, clip: looping, transition: None });
+    step_until(&e, 0.0, showing(1));
+    for _ in 0..10 {
+        e.step(0.05);
+    }
+    let s = e.snapshot();
+    assert!(!s.layers[1].finished && s.layers[1].pos < 0.2, "a loop wraps: {}", s.layers[1].pos);
+    e.send(Command::Seek { layer: Some(1), secs: 0.15 });
+    step_until(&e, 0.0, |s| (s.layers[1].pos - 0.15).abs() < 1e-6);
+    e.shutdown().unwrap();
+}
+
+#[test]
+fn images_without_a_set_duration_last_the_default() {
+    let e = engine();
+    e.send(Command::Trigger { layer: 0, clip: stretch("red_64x36.png"), transition: None });
+    let s = step_until(&e, 0.0, showing(0));
+    assert!((s.layers[0].duration - evj_core::model::DEFAULT_IMAGE_SECS).abs() < 1e-9);
+    assert!(s.layers[0].remaining.is_some());
+    e.shutdown().unwrap();
+}
+
+#[test]
+fn layer_one_is_drawn_on_top() {
+    let e = engine();
+    e.send(Command::Trigger { layer: 0, clip: stretch("red_64x36.png"), transition: None });
+    e.send(Command::Trigger { layer: 1, clip: stretch("blue_36x64.jpg"), transition: None });
+    step_until(&e, 0.016, |s| s.layers[0].has_frame && s.layers[1].has_frame);
+    e.step(0.016);
+    let c = centre(&pixels(&e));
+    assert!(c[0] > 240 && c[2] < 10, "layer index 0 covers index 1: {c:?}");
+    e.shutdown().unwrap();
+}
+
+#[test]
+fn moving_a_layer_keeps_its_clip_playing() {
+    let e = engine();
+    e.send(Command::Trigger { layer: 0, clip: Clip::new(fixture("hap1_64x48.mov")), transition: None });
+    e.send(Command::SetLayer { layer: 0, props: Layer { opacity: 0.5, ..Layer::default() } });
+    step_until(&e, 0.016, showing(0));
+    let before = e.snapshot().layers[0].pos;
+    e.send(Command::MoveLayer { from: 0, to: 2 });
+    let s = step_until(&e, 0.016, |s| s.layers[2].has_frame);
+    assert!(s.layers[0].clip_name.is_none() && s.layers[2].clip_name.as_deref() == Some("hap1_64x48"), "{s:?}");
+    assert!(s.layers[2].pos >= before, "not restarted: {} < {before}", s.layers[2].pos);
     e.shutdown().unwrap();
 }
 
@@ -816,8 +885,8 @@ fn cue_pixels(e: &Engine) -> Vec<u8> {
 #[test]
 fn scene_preview_blends_the_layers() {
     let e = cue_engine();
-    e.send(Command::SetLayer { layer: 1, props: Layer { opacity: 0.5, ..Layer::default() } });
-    e.send(Command::CueScene(vec![Some(stretch("blue_36x64.jpg")), Some(stretch("red_64x36.png")), None, None]));
+    e.send(Command::SetLayer { layer: 0, props: Layer { opacity: 0.5, ..Layer::default() } });
+    e.send(Command::CueScene(vec![Some(stretch("red_64x36.png")), Some(stretch("blue_36x64.jpg")), None, None]));
     let s = step_until(&e, 0.016, |s| s.cue.is_some() && s.cue_layers == 2);
     assert!(s.layers.iter().all(|l| l.clip_name.is_none()), "nothing on Program");
     e.step(0.016);
@@ -951,5 +1020,91 @@ fn changing_the_program_device_restarts_attached_audio() {
         e.step(0.0);
     }
     step_until(&e, 0.0, |s| s.layers[0].voices == 1 && s.layers[0].audio_peaks[0] > 0.0);
+    e.shutdown().unwrap();
+}
+
+fn pick(e: &Engine, at: evj_engine::PickAt, pos: [f32; 2]) -> Option<[f32; 3]> {
+    let (tx, rx) = channel();
+    e.send(Command::PickColor { at, pos, reply: tx });
+    e.step(0.0);
+    rx.recv().unwrap()
+}
+
+#[test]
+fn the_eyedropper_reads_the_clip_before_its_chroma_key() {
+    let e = engine();
+    let mut key = evj_core::effect::EffectRef::new("Chroma Key");
+    for (p, v) in [("key_r", 1.0), ("key_g", 0.0), ("key_b", 0.0)] {
+        key.param_mut(p, 0.0).value = v;
+    }
+    let red = Clip { effects: vec![key], ..stretch("red_64x36.png") };
+    e.send(Command::Trigger { layer: 0, clip: red, transition: None });
+    step_until(&e, 0.016, showing(0));
+    e.step(0.016);
+    assert!(centre(&pixels(&e))[0] < 20, "the red is keyed out on Program");
+    let c = pick(&e, evj_engine::PickAt::Program(0), [0.5, 0.5]).expect("a colour");
+    assert!(c[0] > 0.9 && c[1] < 0.1 && c[2] < 0.1, "the source is still red: {c:?}");
+    assert_eq!(pick(&e, evj_engine::PickAt::Program(1), [0.5, 0.5]), None, "nothing plays on layer 2");
+    e.shutdown().unwrap();
+}
+
+#[test]
+fn a_chroma_keyed_clip_keeps_what_is_not_its_key_colour() {
+    let e = engine();
+    // Green key (the default) on a red picture: nothing to remove, the red stays over the blue.
+    let red = Clip { effects: vec![evj_core::effect::EffectRef::new("Chroma Key")], ..stretch("red_64x36.png") };
+    e.send(Command::Trigger { layer: 0, clip: red, transition: None });
+    e.send(Command::Trigger { layer: 1, clip: stretch("blue_36x64.jpg"), transition: None });
+    step_until(&e, 0.016, |s| s.layers[0].has_frame && s.layers[1].has_frame);
+    e.step(0.016);
+    let c = centre(&pixels(&e));
+    assert!(c[0] > 200 && c[2] < 60, "red on top: {c:?}");
+    e.shutdown().unwrap();
+    // A picture exactly the composition's size takes the direct path (no layer copy).
+    let e = Engine::start(EngineConfig { device: DeviceKind::Warp, manual_clock: true, width: 64, height: 36, layers: 2, effect_folders: vec![], audio: false }).unwrap();
+    let red = Clip { effects: vec![evj_core::effect::EffectRef::new("Chroma Key")], ..Clip::new(fixture("red_64x36.png")) };
+    e.send(Command::Trigger { layer: 0, clip: red, transition: None });
+    e.send(Command::Trigger { layer: 1, clip: stretch("blue_36x64.jpg"), transition: None });
+    step_until(&e, 0.016, |s| s.layers[0].has_frame && s.layers[1].has_frame);
+    e.step(0.016);
+    let px = pixels(&e);
+    let i = (18 * 64 + 32) * 4;
+    assert!(px[i] > 200 && px[i + 2] < 60, "full-size picture: red on top: {:?}", &px[i..i + 4]);
+    e.shutdown().unwrap();
+}
+
+#[test]
+fn keyed_out_parts_of_the_preview_are_black() {
+    let e = cue_engine();
+    let mut key = evj_core::effect::EffectRef::new("Chroma Key");
+    for (p, v) in [("key_r", 1.0), ("key_g", 0.0), ("key_b", 0.0)] {
+        key.param_mut(p, 0.0).value = v;
+    }
+    e.send(Command::CueClip(Some(Clip { effects: vec![key], ..stretch("red_64x36.png") })));
+    step_until(&e, 0.016, |s| s.cue_state.is_some());
+    e.step(0.016);
+    let px = cue_pixels(&e);
+    let mid = (160 * 640 + 320) * 4; // RGBA
+    assert_eq!(&px[mid..mid + 4], &[0, 0, 0, 255], "keyed out: black, not the colour left after spill");
+    e.shutdown().unwrap();
+}
+
+#[test]
+fn the_eyedropper_ignores_clicks_beside_a_fitted_clip_and_reads_the_preview() {
+    let e = engine();
+    // A portrait picture fitted into the 8x4 composition: bars left and right.
+    e.send(Command::Trigger { layer: 0, clip: Clip::new(fixture("blue_36x64.jpg")), transition: None });
+    step_until(&e, 0.016, showing(0));
+    assert_eq!(pick(&e, evj_engine::PickAt::Program(0), [0.05, 0.5]), None, "a bar, not the clip");
+    let c = pick(&e, evj_engine::PickAt::Program(0), [0.5, 0.5]).unwrap();
+    assert!(c[2] > 0.9 && c[0] < 0.1, "blue: {c:?}");
+    let (tx, rx) = channel();
+    e.send(Command::ShareCuePreview(tx));
+    e.step(0.0);
+    rx.recv().unwrap().unwrap();
+    e.send(Command::CueClip(Some(stretch("red_64x36.png"))));
+    step_until(&e, 0.016, |s| s.cue_state.is_some());
+    let c = pick(&e, evj_engine::PickAt::Preview, [0.3, 0.7]).unwrap();
+    assert!(c[0] > 0.9 && c[2] < 0.1, "the cued clip: {c:?}");
     e.shutdown().unwrap();
 }

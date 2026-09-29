@@ -62,7 +62,7 @@ impl AppAction {
             AppAction::AddLayer => "Add layer",
             AppAction::PreviewPlayPause => "Preview: play / pause",
             AppAction::PreviewStop => "Preview: stop (rewind)",
-            AppAction::Take => "TAKE (Preview → Program)",
+            AppAction::Take => "TAKE (Preview › Program)",
             AppAction::ProgramStop => "Program: stop (clear all layers)",
             AppAction::Blackout => "Blackout",
             AppAction::Panic => "PANIC",
@@ -73,7 +73,7 @@ impl AppAction {
             AppAction::ShowOutputs => "Output Manager",
             AppAction::MarkIn => "Timeline: set start at the Preview playhead",
             AppAction::MarkOut => "Timeline: set end at the Preview playhead",
-            AppAction::SeqNext => "Sequence: next clip now",
+            AppAction::SeqNext => "Chain: next step / scene now",
         }
     }
 }

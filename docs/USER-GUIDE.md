@@ -30,17 +30,19 @@ Clip berlabel **HEAVY** di-decode CPU lewat FFmpeg (mis. ProRes). Klik kanan cli
 - **PROGRAM** (merah) = yang dilihat penonton. Di bawahnya setiap layer yang tayang punya baris hitung mundur (`-0:45`). Kurang dari 10 detik: merah berkedip. Di sampingnya meter master L/R dalam dB dan lampu **CLIP** (klik untuk mematikan).
 - **PREVIEW** (hijau) = clip atau scene yang dipilih, belum tayang. **1 klik** slot = masuk Preview. **Double-click** = langsung ke Program. **TAKE ▶** atau **Enter** menayangkan isi Preview dengan transisi.
 - Tombol di bawah Preview: ▶/⏸ (**Space**) dan ■ kembali ke awal (**Shift+Space**). **Shift+Enter** mengosongkan semua layer Program.
-- Bingkai slot: merah = tayang (Program), hijau = di Preview. Pojok kanan bawah slot menampilkan durasi media.
+- Bingkai slot: merah = tayang (Program), hijau = di Preview. Pojok kanan bawah slot menampilkan durasi media. Gambar juga punya durasi (default 5 detik, ubah di *Clip settings → Image duration*): hitung mundur, progress dan timeline-nya sama seperti video. **Loop** mengulang hitungannya (gambar tetap tampil), **Once** berhenti di 0 dan gambarnya tetap tampil.
 
 
 - **Scene** (header kolom, mis. "Scene 1"): **1 klik** = seluruh kolom tampil di Preview (semua layer digabung dengan opacity/blend-nya, tanpa efek). **Double-click** atau **TAKE** = semua layer berganti di Program; layer tanpa clip di kolom itu dikosongkan. Klik kanan → **Rename…** untuk memberi nama (mis. "Opening").
+- **Urutan layer**: **Layer 1 ada di baris paling atas dan tampil paling depan** (menutupi layer di bawahnya). **+ Layer** menambah layer di bawah. **⏶ / ⏷** di kontrol layer memindahkan layer beserta semua slotnya; clip yang sedang tayang tetap jalan. Show lama otomatis dibalik saat dibuka sehingga tampilannya tetap sama (nama default "Layer N" ikut nomor baru).
+- **Hapus**: klik kanan nama layer → **Delete layer…**, klik kanan header scene → **Delete scene…** (dengan konfirmasi, berlaku di semua deck; yang sedang tayang dikosongkan dulu). Terkunci saat 🔒 Lock.
 - **✖** di layer mengosongkan layer. **B** = bypass (sembunyikan), **S** = solo, slider = opacity, **M** + slider kedua = mute dan volume layer.
 - **Map keys**: aktifkan, klik slot / scene / ✖ layer / TAP, lalu tekan tombol keyboard. Esc menghapus binding. Matikan Map keys setelah selesai.
 - **BLACKOUT** (**B**): semua output fade ke hitam dalam 0,5 detik. Tekan lagi untuk kembali.
 - **PANIC** (**F12**, tombol merah kanan atas): semua layer dikosongkan, *panic media* diputar di layer 1, suara fade out. Klik kanan slot → **Set as panic media** untuk memilihnya. Kalau belum diset, dipakai layer 1 kolom 1.
 - **🔒 Lock** (**Ctrl+Shift+L**): kunci saat live. Trigger, TAKE, volume, opacity, blackout, panic dan slide tetap bisa. Tambah/hapus media, efek, output, New/Open diblokir. Tahan tombol 1 detik untuk membuka.
 - **Opacity** (bar berwarna layer) dan **volume** (fader dB, double-click = 0 dB) bisa diketik: klik angka lalu ketik `75%` atau `-6`. Meter kecil tiap layer menunjukkan level L/R.
-- **Shortcuts** (**F1**): semua tombol keyboard aplikasi bisa diubah. Tambahan timeline: **I** / **O** = start / end di posisi Preview, **N** = clip berikutnya di rangkaian. Tabrakan ditandai oranye. Tombol yang dipakai shortcut aplikasi tidak bisa dipakai di Map keys.
+- **Shortcuts** (**F1**): semua tombol keyboard aplikasi bisa diubah. Tambahan timeline: **I** / **O** = start / end di posisi Preview, **N** = langkah / scene berikutnya di chain. Tabrakan ditandai oranye. Tombol yang dipakai shortcut aplikasi tidak bisa dipakai di Map keys.
 - **Simpan**: setelah show pernah di-Save, perubahan disimpan otomatis tiap 60 detik (status bar: *✓ Saved hh:mm*). Menutup EVJ, New atau Open dengan perubahan belum disimpan akan bertanya dulu.
 
 ### Timeline clip (panel bawah)
@@ -54,13 +56,22 @@ Klik sebuah clip: panel **Timeline** di bawah grid menampilkan clip itu.
 - **♪ Attach audio…**: tempelkan file musik ke video atau foto. **Replace** = suara asli clip dimatikan, **Mix** = keduanya. Volume sendiri. Audio mulai bersama clip dan ikut seek/stop. Foto dengan audio tempelan tayang selama audionya (hitung mundur Program ikut).
 - Saat 🔒 Lock: seek dan play tetap bisa; penanda, Loop dan audio tempelan terkunci.
 
-### Rangkaian clip (sequence)
+### Chain: layer berurutan dan scene berurutan
 
-1. **Shift+klik** beberapa slot di satu layer (bingkai biru muda).
-2. Klik kanan salah satunya → **Make sequence**. Slot mendapat garis biru dan nomor (1/3, 2/3 …).
-3. Trigger slot mana pun di rangkaian → clip diputar satu per satu **tanpa jeda**. Foto tampil 5 detik (atur di klik kanan → *Still images*). **Loop the whole sequence** mengulang dari awal.
-4. Clip dengan loop A–B (Loop + start/end diatur) terus berulang sampai **⏭** ditekan (baris layer di bawah PROGRAM, atau tombol **N**). Baris itu juga menampilkan **SEQ 2/5**.
-5. Trigger slot di luar rangkaian, ✖, atau PANIC menghentikan rangkaian. Klik kanan → **Break sequence** untuk membubarkannya.
+Di dalam chain, clip diputar sekali (gambar selama durasinya). Clip dengan loop A–B (⟲ Loop + start/end diatur) terus berulang sampai **⏭** / **N**.
+
+**Layer chain** (beberapa layer dalam satu scene, 1 → 2 → 3):
+
+1. **Shift+klik** slot beberapa layer di **satu scene** (bingkai biru muda), klik kanan salah satunya → **Chain layers**. Slot-slotnya tersambung garis berwarna di tepi kiri dengan nomor langkah.
+2. Pilih salah satu slotnya: di panel **Preview → Chain**, tiap langkah setelah yang pertama punya **start** — *when the one before ends* (saat langkah sebelumnya selesai) atau *after N s* (N detik setelah langkah sebelumnya mulai) — dan **mode** — **Replace** (layer sebelumnya dikosongkan) atau **Overlay 🗗** (layer sebelumnya tetap jalan, ditumpuk). Di akhir: **■ Stop** atau **⟲ Loop** (semua layer chain dikosongkan lalu mulai lagi dari langkah 1).
+3. Trigger slot langkah pertama (atau scene-nya) → chain berjalan. Tanda di slot: `1 ■` / `1 ⟲` di langkah pertama, `+10.0s` untuk start berdetik, `🗗` untuk overlay.
+
+**Scene chain** (scene 1 → 2 → 3):
+
+1. **Shift+klik** beberapa header scene — atau satu slot di tiap scene — lalu klik kanan salah satunya → **Chain scenes**. Headernya mendapat pita berwarna dan nomor urut.
+2. Trigger scene pertama → scene berikutnya mulai saat **clip terpanjang** di scene itu selesai (layer chain di dalamnya dihitung sampai chain itu selesai; layer chain yang Loop menahan scene sampai ⏭). **■ Stop** di scene terakhir atau **⟲ Loop** kembali ke scene pertama (atur di Preview → Chain).
+
+Di bawah PROGRAM tampil **CHAIN 2/3 · Scene** atau **CHAIN 2/3 · Layer** dengan tombol **⏭**. Trigger manual di layer yang ikut chain, ✖, PANIC atau show baru menghentikan chain (overlay di layer lain tidak). Klik kanan → **Break layer chain / Break scene chain** untuk membubarkan. Status bar menunjukkan apa yang akan dibuat dari pilihan Shift+klik; di menu, *Chain…* abu-abu berarti belum ada 2 pilihan. Rangkaian (*sequence*) dari show lama otomatis menjadi scene chain.
 
 ### Properti clip (panel kanan)
 
@@ -73,6 +84,13 @@ Klik nama layer untuk mengatur blend mode (10 mode), transisi default, dan efek 
 ## 4. Efek & BPM
 
 - **+ Add effect** di panel properti. Setiap parameter punya slider dan tombol **LFO** (sine/saw/square/triangle/random, 1/4–16 beat).
+- **Chroma Key** (menghapus satu warna dari gambar atau video):
+  - Pilih clip, lalu di *Clip settings & effects* pilih **+ Add effect → Chroma Key**.
+  - Tekan **Pick**, lalu klik warna yang ingin dihapus di monitor **Preview**, atau di **Program** bila clip itu sedang tayang. Esc membatalkan.
+  - Warna diambil dari gambar asli clip, jadi tetap benar walau area itu sudah terhapus. Kotak warna di sebelah Pick juga bisa diklik untuk memilih warna secara manual.
+  - **tolerance** = seberapa mirip warna yang ikut terhapus, **softness** = kehalusan tepi, **spill** = mengurangi pantulan hijau/biru di tepi dan rambut.
+  - Untuk green/blue screen, bayangan di layar ikut terhapus. Untuk latar putih/hitam, teks abu-abu tetap aman.
+  - Untuk menghapus dua warna, tambahkan Chroma Key dua kali. Bagian yang terhapus memperlihatkan layer di bawahnya; di monitor Preview tampil hitam.
 - BPM: ketik angka, tekan **TAP** mengikuti ketukan, **−/+** untuk nudge, **1** untuk resync (sekarang = beat satu).
 - Efek buatan sendiri: file `.hlsl` di folder `effects` (lihat `effects\README.md`).
 

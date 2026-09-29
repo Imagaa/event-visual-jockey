@@ -103,9 +103,9 @@ impl Active {
         self.player.info.kind == DecoderKind::Image && self.attached_secs > 0.0 && self.clip.attached.is_some()
     }
 
-    /// Clip length (seconds); a still with attached audio lasts as long as the audio.
+    /// Clip length (seconds); an image lasts its own duration, or as long as its attached audio.
     pub fn duration(&self) -> f64 {
-        if self.timed_by_attached() { self.attached_secs } else { self.player.info.duration }
+        if self.player.info.kind == DecoderKind::Image { self.range().1 } else { self.player.info.duration }
     }
 
     /// Attached audio clock (seconds since it started) while it plays.
@@ -114,14 +114,14 @@ impl Active {
         Some(self.attached_start + v.position_secs(self.audio_rate))
     }
 
-    /// The clip-time range that plays: (start, end) seconds. Stills: (0, still_secs or 0).
+    /// The clip-time range that plays: (start, end) seconds. Images: (0, their duration).
     pub fn range(&self) -> (f64, f64) {
         let d = self.player.info.duration;
         if self.timed_by_attached() {
             return (0.0, self.attached_secs);
         }
         if self.player.info.kind == DecoderKind::Image {
-            return (0.0, self.clip.still_secs.unwrap_or(0.0));
+            return (0.0, self.clip.image_secs());
         }
         if d <= 0.0 { (0.0, 0.0) } else { evj_core::playhead::in_out(&self.clip, d) }
     }
@@ -176,14 +176,14 @@ impl Active {
         if info.random_access && info.kind != DecoderKind::Image { self.head.pos } else { self.seq_time }
     }
 
-    /// Seconds until the clip ends (out point) at its current speed; None for stills / unknown length.
+    /// Seconds until the clip ends (out point) at its current speed; None for unknown length.
     pub fn remaining(&self, bpm: f64) -> Option<f64> {
         let info = &self.player.info;
         if self.timed_by_attached() {
             return Some((self.attached_secs - self.seq_time).max(0.0));
         }
         if info.kind == DecoderKind::Image {
-            return self.clip.still_secs.map(|s| (s - self.seq_time).max(0.0));
+            return Some((self.clip.image_secs() - self.seq_time).max(0.0));
         }
         if info.duration <= 0.0 {
             return None;
@@ -207,7 +207,7 @@ impl Active {
         }
         let dt = if self.paused { 0.0 } else { dt };
         let info = self.player.info.clone();
-        // A still with a duration (sequences) ends after it.
+        // Images run a clock over their duration: Once stops at the end (the picture stays), else it wraps.
         if self.timed_by_attached() {
             let len = self.attached_secs;
             if let Some(t) = self.attached_time() {
@@ -218,9 +218,12 @@ impl Active {
                 self.ended = true;
             }
         } else if info.kind == DecoderKind::Image {
-            if let Some(s) = self.clip.still_secs {
-                self.seq_time = (self.seq_time + dt).min(s);
-                self.ended |= self.seq_time >= s;
+            let len = self.clip.image_secs().max(1e-3);
+            if self.clip.mode == PlayMode::Once {
+                self.seq_time = (self.seq_time + dt).min(len);
+                self.ended |= self.seq_time >= len;
+            } else {
+                self.seq_time = (self.seq_time + dt) % len;
             }
         }
         let audio_t = self.audio_time();

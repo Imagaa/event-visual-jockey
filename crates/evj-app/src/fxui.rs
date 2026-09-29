@@ -4,8 +4,29 @@ use evj_core::lfo::{Lfo, Wave};
 use evj_engine::fx::EffectInfo;
 use evj_engine::{Command, Snapshot};
 
-/// Edits `chain` in place; true when anything changed.
-pub fn chain(ui: &mut egui::Ui, salt: &str, chain: &mut Vec<EffectRef>, lib: &[EffectInfo]) -> bool {
+/// What the effect editor reports besides "changed": an eyedropper request (index of the effect
+/// whose Pick was pressed) and where its widgets are (layout checks, tests).
+#[derive(Default)]
+pub struct ChainOut {
+    pub pick: Option<usize>,
+    pub rects: Vec<(String, egui::Rect)>,
+}
+
+/// The three parameters that make up a key colour (Chroma Key, or any effect using them).
+const KEY: [&str; 3] = ["key_r", "key_g", "key_b"];
+
+/// A key colour (0..1, as the picture's pixels: sRGB) as the swatch's bytes, and back.
+fn key_bytes(v: [f64; 3]) -> [u8; 3] {
+    v.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+fn key_values(b: [u8; 3]) -> [f64; 3] {
+    b.map(|c| c as f64 / 255.0)
+}
+
+/// Edits `chain` in place; true when anything changed. `eyedropper`: effects with a key colour
+/// get a Pick button (clip effects: the clip is on a monitor).
+pub fn chain(ui: &mut egui::Ui, salt: &str, chain: &mut Vec<EffectRef>, lib: &[EffectInfo], eyedropper: bool, out: &mut ChainOut) -> bool {
     let mut changed = false;
     let mut action: Option<(usize, i32)> = None; // (index, -1 up / +1 down / 0 remove)
     let n = chain.len();
@@ -16,7 +37,7 @@ pub fn chain(ui: &mut egui::Ui, salt: &str, chain: &mut Vec<EffectRef>, lib: &[E
             None => format!("{} (missing)", e.name),
         };
         let id = ui.make_persistent_id((salt, i, &e.name));
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+        let (toggle, _, _) = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
             .show_header(ui, |ui| {
                 changed |= ui.checkbox(&mut e.bypass, "").on_hover_text("Bypass").changed();
                 ui.label(egui::RichText::new(title).strong());
@@ -24,10 +45,10 @@ pub fn chain(ui: &mut egui::Ui, salt: &str, chain: &mut Vec<EffectRef>, lib: &[E
                     if ui.small_button("✖").clicked() {
                         action = Some((i, 0));
                     }
-                    if i + 1 < n && ui.small_button("⬇").clicked() {
+                    if i + 1 < n && ui.small_button("⏷").on_hover_text("Move down").clicked() {
                         action = Some((i, 1));
                     }
-                    if i > 0 && ui.small_button("⬆").clicked() {
+                    if i > 0 && ui.small_button("⏶").on_hover_text("Move up").clicked() {
                         action = Some((i, -1));
                     }
                 });
@@ -37,7 +58,29 @@ pub fn chain(ui: &mut egui::Ui, salt: &str, chain: &mut Vec<EffectRef>, lib: &[E
                     ui.label("This effect is not in the library (renamed or deleted).");
                     return;
                 };
-                for d in &info.meta.params {
+                let keyed = KEY.iter().all(|k| info.meta.params.iter().any(|p| p.name == *k));
+                if keyed {
+                    ui.horizontal(|ui| {
+                        ui.label("key colour");
+                        let def = |k: &str| info.meta.params.iter().find(|p| p.name == k).map_or(0.0, |p| p.default as f64);
+                        // sRGB bytes: the swatch shows the key exactly as the picture's pixels.
+                        let mut rgb = key_bytes(KEY.map(|k| e.param_mut(k, def(k)).value));
+                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                            for (k, v) in KEY.iter().zip(key_values(rgb)) {
+                                e.param_mut(k, def(k)).value = v;
+                            }
+                            changed = true;
+                        }
+                        if eyedropper {
+                            let b = ui.button("Pick").on_hover_text("Then click the colour on the Preview or Program monitor (Esc cancels)");
+                            out.rects.push(("Pick".into(), b.rect));
+                            if b.clicked() {
+                                out.pick = Some(i);
+                            }
+                        }
+                    });
+                }
+                for d in info.meta.params.iter().filter(|d| !(keyed && KEY.contains(&d.name.as_str()))) {
                     let p = e.param_mut(&d.name, d.default as f64);
                     ui.horizontal(|ui| {
                         ui.label(&d.name);
@@ -69,6 +112,7 @@ pub fn chain(ui: &mut egui::Ui, salt: &str, chain: &mut Vec<EffectRef>, lib: &[E
                     }
                 }
             });
+        out.rects.push((e.name.clone(), toggle.rect));
     }
     if let Some((i, dir)) = action {
         match dir {
@@ -131,4 +175,17 @@ pub fn bpm(ui: &mut egui::Ui, snap: &Snapshot, commands: &mut Vec<Command>) -> O
         ui.painter().circle_filled(c, if on { 5.0 } else { 4.0 }, color);
     }
     edited
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{key_bytes, key_values};
+
+    #[test]
+    fn the_swatch_shows_the_key_as_the_pictures_pixels() {
+        assert_eq!(key_bytes([0.0, 0.69, 0.25]), [0, 176, 64], "no linear / sRGB conversion");
+        assert_eq!(key_bytes([1.2, -0.1, 1.0]), [255, 0, 255]);
+        let back = key_values([0, 176, 64]);
+        assert!((back[1] - 176.0 / 255.0).abs() < 1e-12);
+    }
 }

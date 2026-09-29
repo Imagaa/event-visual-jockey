@@ -1,3 +1,4 @@
+use evj_core::keymap;
 use evj_core::model::*;
 use std::path::PathBuf;
 
@@ -73,52 +74,97 @@ fn filled(cols: usize) -> Deck {
 }
 
 #[test]
-fn sequences_need_two_filled_slots_in_one_layer_and_are_ordered() {
-    let mut d = filled(4);
-    assert!(!d.make_sequence(0, &[1]), "one slot is not a sequence");
-    assert!(!d.make_sequence(1, &[0, 1]), "empty slots do not count");
-    assert!(d.make_sequence(0, &[3, 1, 2]));
-    assert_eq!(d.sequences[0].cols, vec![1, 2, 3]);
-    assert_eq!(d.sequence_at(0, 2).map(|(i, _)| i), Some(0));
-    assert!(d.sequence_at(0, 0).is_none());
+fn layer_chains_live_in_one_column() {
+    let mut p = Project::new_default();
+    for l in 0..3 {
+        p.decks[0].slots[l][2] = Some(Clip::new(PathBuf::from(format!("C:/m/{l}.mov"))));
+    }
+    let d = &mut p.decks[0];
+    assert!(!d.make_layer_chain(2, &[0]), "one layer is not a chain");
+    assert!(!d.make_layer_chain(2, &[0, 3]), "layer 4 is empty in that column");
+    assert!(d.make_layer_chain(2, &[2, 0, 1]));
+    assert_eq!(d.layer_chains[0].steps.iter().map(|s| s.layer).collect::<Vec<_>>(), vec![0, 1, 2]);
+    assert_eq!(d.layer_chain_at(1, 2).map(|(i, _)| i), Some(0));
+    assert!(d.layer_chain_at(1, 3).is_none());
+    assert!(d.make_layer_chain(2, &[1, 2]), "a layer belongs to one chain");
+    assert_eq!(d.layer_chains.len(), 1, "the old chain kept only layer 1 and went");
+    d.remove(1, 2);
+    assert!(d.layer_chains.is_empty(), "one member left: no chain");
 }
 
 #[test]
-fn a_slot_belongs_to_one_sequence() {
-    let mut d = filled(4);
-    assert!(d.make_sequence(0, &[0, 1, 2]));
-    assert!(d.make_sequence(0, &[2, 3]));
-    assert_eq!(d.sequences.len(), 2);
-    assert_eq!(d.sequences[0].cols, vec![0, 1]);
-    assert_eq!(d.sequences[1].cols, vec![2, 3]);
+fn scene_chains_and_removing_a_scene() {
+    let mut p = Project::new_default();
+    for c in 0..4 {
+        p.decks[0].slots[0][c] = Some(Clip::new(PathBuf::from(format!("C:/m/{c}.mov"))));
+    }
+    p.decks[0].slots[1][3] = Some(Clip::new(PathBuf::from("C:/m/x.mov")));
+    p.decks[0].slots[2][3] = Some(Clip::new(PathBuf::from("C:/m/y.mov")));
+    assert!(!p.decks[0].make_scene_chain(&[1, 7]), "scene 8 is empty");
+    assert!(p.decks[0].make_scene_chain(&[3, 1, 2]));
+    assert!(p.decks[0].make_layer_chain(3, &[1, 2]));
+    assert_eq!(p.decks[0].scene_chains[0].cols, vec![1, 2, 3]);
+    assert_eq!(p.decks[0].scene_chain_at(2).map(|(i, _)| i), Some(0));
+    p.decks[0].set_scene_name(3, "End");
+    p.keymap.bind("Z", keymap::Action::TriggerColumn(3));
+    p.keymap.bind("Y", keymap::Action::TriggerSlot { layer: 0, col: 2 });
+    p.panic_media = Some((0, 0, 2));
+    let cols = p.columns();
+    p.remove_column(2);
+    assert_eq!(p.columns(), cols - 1);
+    assert_eq!(p.decks[0].scene_chains[0].cols, vec![1, 2], "column 4 moved to 3");
+    assert_eq!(p.decks[0].layer_chains[0].col, 2);
+    assert_eq!(p.decks[0].scene_name(2), "End");
+    assert_eq!(p.keymap.resolve("Z"), Some(&keymap::Action::TriggerColumn(2)));
+    assert_eq!(p.keymap.resolve("Y"), None, "its slot is gone");
+    assert_eq!(p.panic_media, None);
+    p.remove_column(1);
+    assert!(p.decks[0].scene_chains.is_empty(), "one scene left: no chain");
 }
 
 #[test]
-fn removing_slots_and_layers_keeps_sequences_valid() {
-    let mut d = filled(3);
-    d.make_sequence(0, &[0, 1, 2]);
-    d.remove(0, 1);
-    assert_eq!(d.sequences[0].cols, vec![0, 2]);
-    d.remove(0, 0);
-    assert!(d.sequences.is_empty(), "a sequence with one slot left is gone");
+fn moving_a_layer_moves_its_slots_chains_and_keys() {
+    let mut p = Project::new_default();
+    p.decks[0].slots[0][0] = Some(Clip::new(PathBuf::from("C:/m/a.mov")));
+    p.decks[0].slots[1][0] = Some(Clip::new(PathBuf::from("C:/m/b.mov")));
+    p.decks[0].make_layer_chain(0, &[0, 1]);
+    p.decks[0].layer_chains[0].steps[1].mode = StepMode::Overlay;
+    p.composition.layers[0].opacity = 0.5;
+    p.keymap.bind("A", keymap::Action::ClearLayer(0));
+    p.panic_media = Some((0, 1, 0));
+    p.move_layer(0, 1);
+    assert_eq!(p.decks[0].clip(1, 0).unwrap().name, "a");
+    assert_eq!(p.composition.layers[1].opacity, 0.5);
+    let steps = &p.decks[0].layer_chains[0].steps;
+    assert_eq!(steps.iter().map(|s| s.layer).collect::<Vec<_>>(), vec![0, 1], "steps re-sorted by layer");
+    assert_eq!(steps[1].mode, StepMode::Replace, "a step's settings move with its layer");
+    assert_eq!(p.keymap.resolve("A"), Some(&keymap::Action::ClearLayer(1)));
+    assert_eq!(p.panic_media, Some((0, 0, 0)));
+}
+
+#[test]
+fn removing_a_layer_keeps_chains_valid() {
+    let mut p = Project::new_default();
+    for l in 0..3 {
+        p.decks[0].slots[l][0] = Some(Clip::new(PathBuf::from(format!("C:/m/{l}.mov"))));
+    }
+    p.decks[0].make_layer_chain(0, &[0, 1, 2]);
+    p.remove_layer(0);
+    assert_eq!(p.decks[0].layer_chains[0].steps.iter().map(|s| s.layer).collect::<Vec<_>>(), vec![0, 1]);
+    p.remove_layer(0);
+    assert!(p.decks[0].layer_chains.is_empty());
+}
+
+#[test]
+fn swapping_a_chain_slot_breaks_that_chain() {
     let mut p = Project::new_default();
     p.decks[0] = filled(3);
-    p.decks[0].slots.resize(p.composition.layers.len(), vec![None; 3]);
-    p.decks[0].make_sequence(0, &[0, 1]);
-    p.decks[0].slots[2][0] = Some(Clip::new(PathBuf::from("C:/m/x.mov")));
-    p.decks[0].slots[2][1] = Some(Clip::new(PathBuf::from("C:/m/y.mov")));
-    p.decks[0].make_sequence(2, &[0, 1]);
-    p.remove_layer(0);
-    assert_eq!(p.decks[0].sequences.len(), 1);
-    assert_eq!(p.decks[0].sequences[0].layer, 1, "the layer above moved down");
-}
-
-#[test]
-fn swapping_a_sequence_slot_breaks_that_sequence() {
-    let mut d = filled(3);
-    d.make_sequence(0, &[0, 1]);
-    d.swap((0, 1), (0, 2));
-    assert!(d.sequences.is_empty());
+    p.decks[0].slots[1][0] = Some(Clip::new(PathBuf::from("C:/m/x.mov")));
+    p.decks[0].make_layer_chain(0, &[0, 1]);
+    p.decks[0].make_scene_chain(&[1, 2]);
+    p.decks[0].swap((0, 0), (0, 1));
+    assert!(p.decks[0].layer_chains.is_empty());
+    assert_eq!(p.decks[0].scene_chains.len(), 1, "scenes keep their order");
 }
 
 #[test]

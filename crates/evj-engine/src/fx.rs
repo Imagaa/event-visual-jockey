@@ -25,6 +25,7 @@ const BUILTIN: &[(&str, &str)] = builtin!(
     "wave.hlsl",
     "feedback.hlsl",
     "vignette.hlsl",
+    "chroma_key.hlsl",
     "test_pattern.hlsl",
     "pointer.hlsl",
     "transitions/crossfade.hlsl",

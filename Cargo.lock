@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "evj-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "egui",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "evj-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "evj-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "evj-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "evj-audio",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "evj-media"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "evj-render",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "evj-present"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "evj-core",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "evj-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "windows",

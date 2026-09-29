@@ -155,3 +155,56 @@ float4 effect(float2 uv) { return length(uv - 0.5) < PROGRESS * 0.75 ? DST(uv) :
     assert!(iris.program.is_some(), "{:?}", iris.error);
     assert!(lib.find("Iris").is_none(), "not offered as an effect");
 }
+
+/// One row of `pixels` (RGBA) through `name` with `set` params; RGBA back.
+fn key(name: &str, pixels: &[[u8; 4]], set: &[(&str, f64)]) -> Vec<[u8; 4]> {
+    let gpu = Gpu::new(DeviceKind::Warp).unwrap();
+    let lib = Library::new(&gpu, vec![]);
+    let e = lib.find(name).unwrap_or_else(|| panic!("{name} missing"));
+    let program = e.program.as_ref().unwrap_or_else(|| panic!("{name}: {:?}", e.error));
+    let w = pixels.len() as u32;
+    let src = Texture::new_color(&gpu, DXGI_FORMAT_R8G8B8A8_UNORM, w, 1).unwrap();
+    src.upload(&gpu.ctx, &pixels.concat(), w * 4);
+    let mut r = EffectRef::new(name);
+    for (p, v) in set {
+        r.param_mut(p, 0.0).value = *v;
+    }
+    let mut fx = FxRunner::new(&gpu, w, 1).unwrap();
+    let params = FxParams { time: 0.0, beat: 0.0, progress: 0.0, values: resolve(&e.meta, &r, 0.0) };
+    let out = fx.pass(&gpu, program, &src, None, &params);
+    fx.readback(&gpu, &out).unwrap().chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+}
+
+#[test]
+fn chroma_key_removes_a_green_screen_and_keeps_the_rest() {
+    let px = key("Chroma Key", &[[0, 177, 64, 255], [20, 150, 50, 255], [220, 40, 40, 255], [230, 200, 170, 255]], &[]);
+    assert!(px[0][3] < 10, "the green screen goes: {:?}", px[0]);
+    assert!(px[1][3] < 60, "a darker green (shadow) goes too: {:?}", px[1]);
+    assert!(px[2][3] > 245, "red stays: {:?}", px[2]);
+    assert!(px[3][3] > 245, "skin stays: {:?}", px[3]);
+}
+
+#[test]
+fn chroma_key_sliders_at_their_top_do_not_wipe_the_picture() {
+    let px = key("Chroma Key", &[[220, 40, 40, 255], [40, 60, 140, 255]], &[("tolerance", 1.0), ("softness", 1.0)]);
+    assert!(px[0][3] > 20 && px[1][3] > 20, "red and a blue suit keep something: {px:?}");
+}
+
+#[test]
+fn chroma_key_on_white_keeps_grey_text() {
+    let white = [("key_r", 1.0), ("key_g", 1.0), ("key_b", 1.0)];
+    let px = key("Chroma Key", &[[255, 255, 255, 255], [250, 250, 248, 255], [120, 120, 120, 255], [0, 0, 0, 255]], &white);
+    assert!(px[0][3] < 10 && px[1][3] < 30, "white background goes: {:?}", &px[..2]);
+    assert!(px[2][3] > 245 && px[3][3] > 245, "grey and black stay: {:?}", &px[2..]);
+}
+
+#[test]
+fn chroma_key_spill_takes_the_green_out_of_edges() {
+    let edge = [[150, 200, 110, 255]];
+    let none = key("Chroma Key", &edge, &[("spill", 0.0)]);
+    let full = key("Chroma Key", &edge, &[("spill", 1.0)]);
+    assert!(full[0][3] > 200, "an edge pixel stays mostly opaque: {:?}", full[0]);
+    let cast = |p: [u8; 4]| p[1] as i32 - (p[0].max(p[2]) as i32);
+    assert!(cast(none[0]) > 40, "without spill the edge stays green: {:?}", none[0]);
+    assert!(cast(full[0]) <= 0, "with spill it is no longer green: {:?}", full[0]);
+}

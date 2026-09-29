@@ -55,11 +55,13 @@ pub fn pair_label(first: u16) -> String {
 pub fn panel(ui: &mut egui::Ui, st: &mut crate::ui::UiState, snap: &evj_engine::Snapshot, act: &mut crate::ui::Actions) {
     use egui::{Color32, RichText};
     ui.strong("Audio outputs");
+    // Asking Windows for its devices costs milliseconds: once, and again when a list opens.
     if st.audio_devices.is_empty() {
         st.audio_devices = evj_audio::AudioEngine::devices();
+        st.default_audio_device = evj_audio::AudioEngine::default_device();
     }
     let devices = st.audio_devices.clone();
-    let default = evj_audio::AudioEngine::default_device();
+    let default = st.default_audio_device.clone();
     let channels = |d: &Option<String>| {
         let name = d.clone().or_else(|| default.clone());
         devices.iter().find(|(n, _)| Some(n) == name.as_ref()).map_or(2, |(_, c)| *c)
@@ -77,6 +79,7 @@ pub fn panel(ui: &mut egui::Ui, st: &mut crate::ui::UiState, snap: &evj_engine::
         });
         if r.response.clicked() {
             st.audio_devices = evj_audio::AudioEngine::devices();
+            st.default_audio_device = evj_audio::AudioEngine::default_device();
         }
         pair_combo(ui, "prog_ch", &mut program.first_channel, channels(&program.device));
         ui.end_row();

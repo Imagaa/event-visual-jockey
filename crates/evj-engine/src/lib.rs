@@ -4,13 +4,15 @@ mod command;
 pub mod fx;
 mod layer;
 mod output;
+mod shared;
 pub mod stats;
+pub use shared::SharedPreview;
 mod sys;
 
-pub use command::{Bus, Command, Pointer};
+pub use command::{Bus, Command, PickAt, Pointer};
 pub use evj_media::DecoderKind;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use evj_core::effect::{EffectRef, resolve};
 use evj_core::model::{FitMode, Layer, PlayMode};
 use evj_core::output::{OutputConfig, OutputSource};
@@ -27,9 +29,6 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::S_OK;
-use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
-use windows::core::Interface;
 
 pub struct EngineConfig {
     pub device: DeviceKind,
@@ -202,11 +201,6 @@ impl Drop for Engine {
     }
 }
 
-struct Preview {
-    rt: RenderTarget,
-    mutex: IDXGIKeyedMutex,
-}
-
 struct State {
     gpu: Gpu,
     comp: Compositor,
@@ -217,7 +211,7 @@ struct State {
     /// Engine clock (seconds), drives tap tempo and effect TIME.
     time: f64,
     outputs: Vec<Output>,
-    preview: Option<Preview>,
+    preview: Option<shared::SharedRing>,
     stats: FrameStats,
     frames: u64,
     lib: Library,
@@ -236,14 +230,14 @@ struct State {
     clear_tex: Texture,
     /// Transition Manager preview: selected transition + its two test cards.
     tr_preview: Option<(String, [Texture; 2])>,
-    tr_preview_rt: Option<Preview>,
+    tr_preview_rt: Option<shared::SharedRing>,
     /// The cued clip for the Preview monitor, and its shared texture.
     /// One entry for a cued clip, one per layer for a cued scene.
     cue: Vec<LayerRt>,
     cue_scene: bool,
     /// Blends a scene for the Preview monitor (at its size).
     cue_comp: Option<Compositor>,
-    cue_rt: Option<Preview>,
+    cue_rt: Option<shared::SharedRing>,
     /// BLACKOUT: current level (0..1) and where it is heading.
     blackout: f32,
     blackout_on: bool,
@@ -491,6 +485,29 @@ fn preview_card(gpu: &Gpu, b: bool) -> Result<Texture> {
     Ok(t)
 }
 
+/// Where a click at `pos` (0..1 of a `comp`-shaped monitor) lands in a `clip`-sized picture
+/// drawn with fit `mode`: the clip's uv, or None beside it.
+pub fn clip_uv(pos: [f32; 2], comp: (u32, u32), clip: (u32, u32), mode: u32) -> Option<[f32; 2]> {
+    let r = fit_rect(clip.0, clip.1, comp.0, comp.1, mode);
+    let (x, y) = (pos[0] * comp.0 as f32, pos[1] * comp.1 as f32);
+    let uv = [(x - r[0]) / r[2], (y - r[1]) / r[3]];
+    uv.iter().all(|v| (0.0..=1.0).contains(v)).then_some(uv)
+}
+
+/// The average colour of a 5×5 pixel patch of `tex` around `uv` (drawn with its own shading, so
+/// NV12 / HAP pictures read as RGB).
+fn sample_patch(gpu: &Gpu, blitter: &Blitter, tex: &Texture, shade: Shade, uv: [f32; 2]) -> Option<[f32; 3]> {
+    const N: u32 = 5;
+    let rt = RenderTarget::new(gpu, N, N).ok()?;
+    let (w, h) = (N as f32 / tex.width.max(1) as f32, N as f32 / tex.height.max(1) as f32);
+    let crop = [(uv[0] - w / 2.0).clamp(0.0, 1.0 - w.min(1.0)), (uv[1] - h / 2.0).clamp(0.0, 1.0 - h.min(1.0)), w.min(1.0), h.min(1.0)];
+    blitter.draw_region(&gpu.ctx, tex, shade, &rt.rtv, [0.0, 0.0, N as f32, N as f32], crop);
+    let px = rt.readback(gpu).ok()?;
+    let n = (px.len() / 4).max(1) as f32;
+    let sum = px.chunks(4).fold([0.0f32; 3], |s, p| [s[0] + p[0] as f32, s[1] + p[1] as f32, s[2] + p[2] as f32]);
+    Some(sum.map(|v| v / n / 255.0))
+}
+
 fn fit_index(f: FitMode) -> u32 {
     match f {
         FitMode::Fit => 0,
@@ -675,6 +692,12 @@ impl State {
                     l.clear(transition, self.tempo.bpm);
                 }
             }
+            Command::MoveLayer { from, to } => {
+                if from < self.layers.len() && to < self.layers.len() {
+                    self.layers.swap(from, to);
+                    self.props.swap(from, to);
+                }
+            }
             Command::SetLayer { layer, props } => {
                 if let Some(p) = self.props.get_mut(layer) {
                     *p = props;
@@ -744,31 +767,39 @@ impl State {
             }
             Command::SharePreview(tx) => {
                 let (w, h) = ((self.comp.width / 2).max(1), (self.comp.height / 2).max(1));
-                let r = RenderTarget::new_shared(&self.gpu, w, h).and_then(|(rt, handle)| {
-                    let mutex = rt.tex.cast::<IDXGIKeyedMutex>().context("keyed mutex")?;
-                    self.preview = Some(Preview { rt, mutex });
-                    Ok((handle, w, h))
+                let r = shared::SharedRing::new(&self.gpu, w, h).map(|(ring, share)| {
+                    self.preview = Some(ring);
+                    share
                 });
                 let _ = tx.send(r);
             }
             Command::ShareTransitionPreview(tx) => {
-                let (w, h) = (256, 144);
-                let r = RenderTarget::new_shared(&self.gpu, w, h).and_then(|(rt, handle)| {
-                    let mutex = rt.tex.cast::<IDXGIKeyedMutex>().context("keyed mutex")?;
-                    self.tr_preview_rt = Some(Preview { rt, mutex });
-                    Ok((handle, w, h))
+                let r = shared::SharedRing::new(&self.gpu, 256, 144).map(|(ring, share)| {
+                    self.tr_preview_rt = Some(ring);
+                    share
                 });
                 let _ = tx.send(r);
             }
             Command::ShareCuePreview(tx) => {
                 let (w, h) = (640, (640 * self.comp.height / self.comp.width.max(1)).max(1));
-                let r = RenderTarget::new_shared(&self.gpu, w, h).and_then(|(rt, handle)| {
-                    let mutex = rt.tex.cast::<IDXGIKeyedMutex>().context("keyed mutex")?;
-                    self.cue_rt = Some(Preview { rt, mutex });
+                let r = shared::SharedRing::new(&self.gpu, w, h).map(|(ring, share)| {
+                    self.cue_rt = Some(ring);
                     self.cue_comp = None;
-                    Ok((handle, w, h))
+                    share
                 });
                 let _ = tx.send(r);
+            }
+            Command::PickColor { at, pos, reply } => {
+                let active = match at {
+                    PickAt::Program(l) => self.layers.get(l).and_then(|l| l.active.as_ref()),
+                    PickAt::Preview => self.cue.first().and_then(|l| l.active.as_ref()),
+                };
+                let colour = active.and_then(|a| {
+                    let tex = a.tex.as_ref()?;
+                    let uv = clip_uv(pos, (self.comp.width, self.comp.height), (tex.width, tex.height), fit_index(a.clip.fit))?;
+                    sample_patch(&self.gpu, &self.blitter, tex, a.shade, uv)
+                });
+                let _ = reply.send(colour);
             }
             Command::CueClip(clip) => {
                 if self.cue_scene {
@@ -788,8 +819,8 @@ impl State {
                 }
             }
             Command::ReadbackCue(tx) => {
-                let px = self.cue_rt.as_ref().and_then(|p| {
-                    if unsafe { (Interface::vtable(&p.mutex).AcquireSync)(Interface::as_raw(&p.mutex), 0, 0) } != S_OK {
+                let px = self.cue_rt.as_ref().map(|r| r.latest()).and_then(|p| {
+                    if !p.acquire() {
                         return None;
                     }
                     // The shared target is BGRA: copy it into an RGBA target first.
@@ -798,9 +829,7 @@ impl State {
                         self.blitter.draw(&self.gpu.ctx, &p.rt.as_texture(), Shade::Rgba, &tmp.rtv, full);
                         tmp.readback(&self.gpu).ok()
                     });
-                    unsafe {
-                        let _ = p.mutex.ReleaseSync(0);
-                    }
+                    p.release();
                     px
                 });
                 let _ = tx.send(px.unwrap_or_default());
@@ -931,6 +960,10 @@ impl State {
                 return;
             }
         }
+        // What the UI previews drew last frame is finished now: hand it over.
+        for r in [&mut self.preview, &mut self.tr_preview_rt, &mut self.cue_rt].into_iter().flatten() {
+            r.tick();
+        }
         self.time += dt;
         self.tempo.advance(dt);
         let step = (dt / 0.5) as f32;
@@ -965,7 +998,8 @@ impl State {
         self.comp.begin(ctx);
         let any_solo = self.props.iter().any(|p| p.solo);
         let mut stages: Vec<String> = Vec::new();
-        for (i, (l, p)) in self.layers.iter().zip(&self.props).enumerate() {
+        // Layer 1 (index 0) is drawn last: on top.
+        for (i, (l, p)) in self.layers.iter().zip(&self.props).enumerate().rev() {
             if timing {
                 if let Some(t) = self.timer.as_mut() {
                     t.mark(ctx);
@@ -1081,53 +1115,50 @@ impl State {
             out
         };
         // Transition Manager preview: A → B on a 2 s loop.
-        if let (Some((name, [a, b])), Some(p)) = (&self.tr_preview, &self.tr_preview_rt) {
+        if let (Some((name, [a, b])), Some(p)) = (&self.tr_preview, self.tr_preview_rt.as_mut()) {
             if let Some((entry, program)) = self.lib.find_transition(name).and_then(|e| e.program.as_ref().map(|pr| (e, pr))) {
                 let progress = ((time % 2.0) / 1.5).min(1.0) as f32;
                 let params = FxParams { time: time as f32, beat: beat as f32, progress, values: resolve(&entry.meta, &EffectRef::new(name), beat) };
                 let t = chains.fx.pass(&self.gpu, program, a, Some(b), &params);
-                if unsafe { (Interface::vtable(&p.mutex).AcquireSync)(Interface::as_raw(&p.mutex), 0, 0) } == S_OK {
-                    self.blitter.draw(ctx, &t, Shade::Rgba, &p.rt.rtv, [0.0, 0.0, p.rt.width as f32, p.rt.height as f32]);
-                    unsafe {
-                        let _ = p.mutex.ReleaseSync(0);
-                    }
-                }
+                let blitter = &self.blitter;
+                p.write(|rt| blitter.draw(ctx, &t, Shade::Rgba, &rt.rtv, [0.0, 0.0, rt.width as f32, rt.height as f32]));
             }
         }
         // Preview monitor: the cued clip with its effects (the composition's scratch target is free now).
-        if let (true, Some(p)) = (self.cue_scene, &self.cue_rt) {
+        if let (true, Some(p)) = (self.cue_scene, self.cue_rt.as_mut()) {
             // A scene: every cued layer blended with its layer's opacity / blend (no effects).
             if self.cue_comp.is_none() {
-                self.cue_comp = Compositor::new(&self.gpu, p.rt.width, p.rt.height).ok();
+                let (w, h) = p.size();
+                self.cue_comp = Compositor::new(&self.gpu, w, h).ok();
             }
             if let Some(comp) = self.cue_comp.as_mut() {
                 comp.begin(ctx);
-                for (l, props) in self.cue.iter().zip(&self.props) {
+                for (l, props) in self.cue.iter().zip(&self.props).rev() {
                     let Some(a) = l.active.as_ref().filter(|_| !props.bypass) else { continue };
                     let Some(tex) = a.tex.as_ref() else { continue };
                     let rect = fit_rect(tex.width, tex.height, comp.width, comp.height, fit_index(a.clip.fit));
                     comp.layer(ctx, tex, a.shade, rect, props.blend.index(), props.opacity);
                 }
-                if unsafe { (Interface::vtable(&p.mutex).AcquireSync)(Interface::as_raw(&p.mutex), 0, 0) } == S_OK {
-                    self.blitter.draw(ctx, &comp.output().as_texture(), Shade::Rgba, &p.rt.rtv, [0.0, 0.0, p.rt.width as f32, p.rt.height as f32]);
-                    unsafe {
-                        let _ = p.mutex.ReleaseSync(0);
-                    }
-                }
+                let (blitter, src) = (&self.blitter, comp.output().as_texture());
+                p.write(|rt| blitter.draw(ctx, &src, Shade::Rgba, &rt.rtv, [0.0, 0.0, rt.width as f32, rt.height as f32]));
             }
-        } else if let (Some(a), Some(p)) = (self.cue[0].active.as_ref(), &self.cue_rt) {
+        } else if let (Some(a), Some(p)) = (self.cue[0].active.as_ref(), self.cue_rt.as_mut()) {
             if let Some(tex) = a.tex.as_ref() {
                 let (w, h) = (self.comp.width, self.comp.height);
                 let clip = Pending::Clip { tex, shade: a.shade, rect: fit_rect(tex.width, tex.height, w, h, fit_index(a.clip.fit)) };
                 let pending = chains.apply_pending(&mut self.comp, "cue", &a.clip.effects, clip);
                 let t = chains.materialize(&mut self.comp, pending);
-                if unsafe { (Interface::vtable(&p.mutex).AcquireSync)(Interface::as_raw(&p.mutex), 0, 0) } == S_OK {
-                    unsafe { ctx.ClearRenderTargetView(&p.rt.rtv, &[0.0, 0.0, 0.0, 1.0]) };
-                    self.blitter.draw(ctx, &t, Shade::Rgba, &p.rt.rtv, [0.0, 0.0, p.rt.width as f32, p.rt.height as f32]);
-                    unsafe {
-                        let _ = p.mutex.ReleaseSync(0);
+                let blitter = &self.blitter;
+                // Over black with its alpha: keyed-out / transparent parts show black.
+                let alpha = self.comp.fixed(0).map(|(_, state)| state);
+                p.write(|rt| {
+                    unsafe { ctx.ClearRenderTargetView(&rt.rtv, &[0.0, 0.0, 0.0, 1.0]) };
+                    let full = [0.0, 0.0, rt.width as f32, rt.height as f32];
+                    match &alpha {
+                        Some(state) => blitter.draw_blend(ctx, &t, Shade::Rgba, &rt.rtv, full, state, 1.0),
+                        None => blitter.draw(ctx, &t, Shade::Rgba, &rt.rtv, full),
                     }
-                }
+                });
             }
         }
         let used = chains.used;
@@ -1158,15 +1189,10 @@ impl State {
                 stages.push("preview".into());
             }
         }
-        if let Some(p) = &self.preview {
-            // Never wait for the UI: skip this preview frame if it holds the texture.
-            let acquired = unsafe { (Interface::vtable(&p.mutex).AcquireSync)(Interface::as_raw(&p.mutex), 0, 0) } == S_OK;
-            if acquired {
-                self.blitter.draw(&self.gpu.ctx, &out, Shade::Rgba, &p.rt.rtv, [0.0, 0.0, p.rt.width as f32, p.rt.height as f32]);
-                unsafe {
-                    let _ = p.mutex.ReleaseSync(0);
-                }
-            }
+        if let Some(p) = self.preview.as_mut() {
+            // Never waits for the UI: a slot it holds is skipped.
+            let (blitter, ctx) = (&self.blitter, &self.gpu.ctx);
+            p.write(|rt| blitter.draw(ctx, &out, Shade::Rgba, &rt.rtv, [0.0, 0.0, rt.width as f32, rt.height as f32]));
         }
         if timing {
             if let Some(t) = self.timer.as_mut() {
@@ -1396,5 +1422,20 @@ impl State {
             master_peak: self.audio.as_ref().map_or(0.0, |a| a.master_peak()),
             audio_underruns: self.audio.as_ref().map_or(0, |a| a.underruns()),
         }
+    }
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::clip_uv;
+
+    #[test]
+    fn a_click_maps_into_the_fitted_clip() {
+        // 16:9 monitor, a square clip fitted: bars left and right (x 0.21875..0.78125).
+        assert_eq!(clip_uv([0.5, 0.5], (1600, 900), (100, 100), 0), Some([0.5, 0.5]));
+        assert_eq!(clip_uv([0.1, 0.5], (1600, 900), (100, 100), 0), None, "a bar");
+        let uv = clip_uv([0.25, 0.0], (1600, 900), (100, 100), 0).unwrap();
+        assert!((uv[0] - 0.0556).abs() < 1e-3 && uv[1] == 0.0);
+        assert_eq!(clip_uv([0.1, 0.9], (1600, 900), (100, 100), 2), Some([0.1, 0.9]), "stretch: the monitor is the clip");
     }
 }

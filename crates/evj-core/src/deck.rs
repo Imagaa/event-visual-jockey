@@ -1,5 +1,6 @@
 //! Editing operations on the clip grid.
-use crate::model::{Clip, Deck, Layer, Project, Sequence};
+use crate::model::{ChainStep, Clip, Deck, Layer, LayerChain, Project, SceneChain};
+use crate::keymap::Action;
 use std::path::PathBuf;
 
 impl Deck {
@@ -40,7 +41,7 @@ impl Deck {
         if let Some(s) = self.slots.get_mut(layer).and_then(|r| r.get_mut(col)) {
             *s = None;
         }
-        self.prune_sequences();
+        self.prune_chains();
     }
 
     pub fn swap(&mut self, a: (usize, usize), b: (usize, usize)) {
@@ -48,13 +49,14 @@ impl Deck {
         if !valid(a) || !valid(b) {
             return;
         }
-        // A moved slot leaves its sequence's order meaningless: the sequence goes.
-        let hit = |s: &Sequence, (l, c): (usize, usize)| s.layer == l && s.cols.contains(&c);
-        self.sequences.retain(|s| !hit(s, a) && !hit(s, b));
+        // A moved slot leaves its layer chain's order meaningless: the chain goes.
+        let hit = |ch: &LayerChain, (l, c): (usize, usize)| ch.col == c && ch.steps.iter().any(|s| s.layer == l);
+        self.layer_chains.retain(|ch| !hit(ch, a) && !hit(ch, b));
         let ca = self.slots[a.0][a.1].take();
         let cb = self.slots[b.0][b.1].take();
         self.slots[a.0][a.1] = cb;
         self.slots[b.0][b.1] = ca;
+        self.prune_chains();
     }
 
     pub fn clip(&self, layer: usize, col: usize) -> Option<&Clip> {
@@ -65,41 +67,79 @@ impl Deck {
         self.slots.get_mut(layer)?.get_mut(col)?.as_mut()
     }
 
-    pub fn sequence_at(&self, layer: usize, col: usize) -> Option<(usize, &Sequence)> {
-        self.sequences.iter().enumerate().find(|(_, s)| s.layer == layer && s.cols.contains(&col))
+    pub fn layer_chain_at(&self, layer: usize, col: usize) -> Option<(usize, &LayerChain)> {
+        self.layer_chains.iter().enumerate().find(|(_, ch)| ch.col == col && ch.steps.iter().any(|s| s.layer == layer))
     }
 
-    /// Filled slots of `layer` become a sequence (column order); they leave any other sequence.
-    pub fn make_sequence(&mut self, layer: usize, cols: &[usize]) -> bool {
-        let mut cols: Vec<usize> = cols.iter().copied().filter(|&c| self.clip(layer, c).is_some()).collect();
+    pub fn scene_chain_at(&self, col: usize) -> Option<(usize, &SceneChain)> {
+        self.scene_chains.iter().enumerate().find(|(_, ch)| ch.cols.contains(&col))
+    }
+
+    fn scene_filled(&self, col: usize) -> bool {
+        self.slots.iter().any(|r| r.get(col).is_some_and(Option::is_some))
+    }
+
+    /// Filled slots of `layers` in column `col` start one after another (layer order);
+    /// they leave any other chain of that column.
+    pub fn make_layer_chain(&mut self, col: usize, layers: &[usize]) -> bool {
+        let mut layers: Vec<usize> = layers.iter().copied().filter(|&l| self.clip(l, col).is_some()).collect();
+        layers.sort_unstable();
+        layers.dedup();
+        if layers.len() < 2 {
+            return false;
+        }
+        for ch in self.layer_chains.iter_mut().filter(|ch| ch.col == col) {
+            ch.steps.retain(|s| !layers.contains(&s.layer));
+        }
+        let steps = layers.into_iter().map(|layer| ChainStep { layer, ..ChainStep::default() }).collect();
+        self.layer_chains.push(LayerChain { col, steps, looping: false });
+        self.prune_chains();
+        true
+    }
+
+    /// Scenes with at least one clip play one after another (column order).
+    pub fn make_scene_chain(&mut self, cols: &[usize]) -> bool {
+        let mut cols: Vec<usize> = cols.iter().copied().filter(|&c| self.scene_filled(c)).collect();
         cols.sort_unstable();
         cols.dedup();
         if cols.len() < 2 {
             return false;
         }
-        for s in self.sequences.iter_mut().filter(|s| s.layer == layer) {
-            s.cols.retain(|c| !cols.contains(c));
+        for ch in &mut self.scene_chains {
+            ch.cols.retain(|c| !cols.contains(c));
         }
-        self.sequences.push(Sequence { layer, cols, ..Sequence::default() });
-        self.prune_sequences();
+        self.scene_chains.push(SceneChain { cols, looping: false });
+        self.prune_chains();
         true
     }
 
-    pub fn break_sequence(&mut self, i: usize) {
-        if i < self.sequences.len() {
-            self.sequences.remove(i);
+    pub fn break_layer_chain(&mut self, i: usize) {
+        if i < self.layer_chains.len() {
+            self.layer_chains.remove(i);
         }
     }
 
-    /// Drops slots that are empty now and sequences with fewer than two slots.
-    fn prune_sequences(&mut self) {
+    pub fn break_scene_chain(&mut self, i: usize) {
+        if i < self.scene_chains.len() {
+            self.scene_chains.remove(i);
+        }
+    }
+
+    /// Drops members that are empty now and chains with fewer than two members.
+    pub(crate) fn prune_chains(&mut self) {
         let slots = &self.slots;
         let filled = |l: usize, c: usize| slots.get(l).and_then(|r| r.get(c)).is_some_and(Option::is_some);
-        for s in &mut self.sequences {
-            let l = s.layer;
-            s.cols.retain(|&c| filled(l, c));
+        for ch in &mut self.layer_chains {
+            let c = ch.col;
+            ch.steps.retain(|s| filled(s.layer, c));
+            ch.steps.sort_by_key(|s| s.layer);
+            ch.steps.dedup_by_key(|s| s.layer);
         }
-        self.sequences.retain(|s| s.cols.len() >= 2);
+        self.layer_chains.retain(|ch| ch.steps.len() >= 2);
+        for ch in &mut self.scene_chains {
+            ch.cols.retain(|&c| slots.iter().any(|r| r.get(c).is_some_and(Option::is_some)));
+        }
+        self.scene_chains.retain(|ch| ch.cols.len() >= 2);
     }
 
     pub fn scene_name(&self, col: usize) -> String {
@@ -133,16 +173,73 @@ impl Project {
         if self.composition.layers.len() <= 1 || layer >= self.composition.layers.len() {
             return;
         }
+        for d in &mut self.decks {
+            for ch in &mut d.layer_chains {
+                ch.steps.retain(|s| s.layer != layer);
+            }
+        }
+        self.keymap.remap(|a| match a {
+            Action::TriggerSlot { layer: l, .. } | Action::ClearLayer(l) if *l == layer => None,
+            a => Some(a.clone()),
+        });
+        if self.panic_media.is_some_and(|(_, l, _)| l == layer) {
+            self.panic_media = None;
+        }
+        self.remap_layers(|l| if l > layer { l - 1 } else { l });
         self.composition.layers.remove(layer);
         for d in &mut self.decks {
             if layer < d.slots.len() {
                 d.slots.remove(layer);
             }
-            d.sequences.retain(|s| s.layer != layer);
-            for s in d.sequences.iter_mut().filter(|s| s.layer > layer) {
-                s.layer -= 1;
-            }
+            d.prune_chains();
         }
+    }
+
+    /// Swaps two layers with their slots in every deck (clips on air follow via the engine's MoveLayer).
+    pub fn move_layer(&mut self, from: usize, to: usize) {
+        let n = self.composition.layers.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        self.remap_layers(|l| if l == from { to } else if l == to { from } else { l });
+        self.composition.layers.swap(from, to);
+        let cols = self.columns();
+        for d in &mut self.decks {
+            d.ensure_size(n, cols);
+            d.slots.swap(from, to);
+        }
+    }
+
+    /// Removes a scene (column) in every deck; at least one column always stays.
+    pub fn remove_column(&mut self, col: usize) {
+        if self.columns() <= 1 || col >= self.columns() {
+            return;
+        }
+        let shift = |c: usize| (c != col).then(|| if c > col { c - 1 } else { c });
+        for d in &mut self.decks {
+            for row in &mut d.slots {
+                if col < row.len() {
+                    row.remove(col);
+                }
+            }
+            if col < d.scene_names.len() {
+                d.scene_names.remove(col);
+            }
+            d.layer_chains.retain(|ch| ch.col != col);
+            for ch in &mut d.layer_chains {
+                ch.col = shift(ch.col).unwrap_or(ch.col);
+            }
+            for ch in &mut d.scene_chains {
+                ch.cols = ch.cols.iter().filter_map(|&c| shift(c)).collect();
+            }
+            d.prune_chains();
+        }
+        self.keymap.remap(|a| match *a {
+            Action::TriggerSlot { layer, col } => shift(col).map(|col| Action::TriggerSlot { layer, col }),
+            Action::TriggerColumn(c) => shift(c).map(Action::TriggerColumn),
+            ref a => Some(a.clone()),
+        });
+        self.panic_media = self.panic_media.and_then(|(d, l, c)| shift(c).map(|c| (d, l, c)));
     }
 
     pub fn add_column(&mut self) {

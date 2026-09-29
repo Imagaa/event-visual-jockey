@@ -20,16 +20,6 @@ pub enum Zone {
     Red,
 }
 
-pub fn zone(db: f32) -> Zone {
-    if db > -6.0 {
-        Zone::Red
-    } else if db > -18.0 {
-        Zone::Yellow
-    } else {
-        Zone::Green
-    }
-}
-
 fn color(z: Zone) -> Color32 {
     match z {
         Zone::Green => Color32::from_rgb(70, 200, 110),
@@ -84,22 +74,6 @@ fn bar(p: &egui::Painter, r: Rect, v: f32, hold: f32, vertical: bool) {
     }
 }
 
-/// Stereo vertical meter with the peak value (dBFS) under it.
-pub fn vmeter(ui: &mut egui::Ui, peaks: [f32; 2], holds: &mut [Hold; 2], now: f64, height: f32) {
-    ui.vertical(|ui| {
-        let (r, _) = ui.allocate_exact_size(vec2(18.0, height), Sense::hover());
-        let p = ui.painter();
-        for c in 0..2 {
-            let x0 = r.min.x + c as f32 * 9.0;
-            let hold = holds[c].update(peaks[c], now);
-            bar(p, Rect::from_min_size(egui::pos2(x0, r.min.y), vec2(8.0, r.height())), peaks[c], hold, true);
-        }
-        let peak_db = db(peaks[0].max(peaks[1]));
-        let text = if peak_db <= FLOOR_DB { "-∞".to_string() } else { format!("{peak_db:.0}") };
-        ui.label(egui::RichText::new(text).small().color(color(zone(peak_db))));
-    });
-}
-
 /// Stereo horizontal mini meter (layer strips).
 pub fn hmeter(ui: &mut egui::Ui, peaks: [f32; 2], holds: &mut [Hold; 2], now: f64, width: f32) {
     let (r, _) = ui.allocate_exact_size(vec2(width, 9.0), Sense::hover());
@@ -128,9 +102,6 @@ mod tests {
         assert_eq!(db(0.0), -120.0, "silence floors instead of -inf");
         assert_eq!(level(0.0), 1.0);
         assert_eq!(level(-60.0), 0.0);
-        assert_eq!(zone(-30.0), Zone::Green);
-        assert_eq!(zone(-10.0), Zone::Yellow);
-        assert_eq!(zone(-3.0), Zone::Red);
     }
 
     #[test]

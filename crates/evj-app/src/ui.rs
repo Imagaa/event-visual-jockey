@@ -4,7 +4,7 @@ use crate::thumbs::{self, Thumb, Thumbnailer};
 use evj_media::convert::HapVariant;
 use evj_media::DecoderKind;
 use evj_core::keymap::Action;
-use evj_core::model::{BlendMode, Clip, FitMode, PlayMode, Project};
+use evj_core::model::{BlendMode, Clip, FitMode, PlayMode, Project, StepMode, StepStart};
 use evj_core::transition::resolve_preset;
 use evj_engine::{Command, Snapshot};
 use egui::{Color32, Rect, RichText, Sense, Stroke, StrokeKind, vec2};
@@ -18,6 +18,22 @@ pub enum Selection {
     Scene(usize),
     Layer(usize),
     Composition,
+}
+
+/// The eyedropper is waiting for a click on a monitor: the clip effect whose key colour it sets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Eyedrop {
+    pub deck: usize,
+    pub layer: usize,
+    pub col: usize,
+    pub effect: usize,
+}
+
+/// A delete waiting for confirmation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Delete {
+    Layer(usize),
+    Scene(usize),
 }
 
 /// What the Preview monitor was last told to show.
@@ -57,6 +73,12 @@ pub struct UiState {
     pub status: String,
     /// Slot rectangles of the last frame (drop target lookup).
     pub slot_rects: Vec<(Rect, usize, usize)>,
+    /// Scene headers and layer clear buttons of the last frame (layout checks, tests).
+    pub scene_rects: Vec<(Rect, usize)>,
+    pub clear_rects: Vec<(Rect, usize)>,
+    pub layer_name_rects: Vec<(Rect, usize)>,
+    /// Preview panel of the last frame: (content width, panel width) — layout checks, tests.
+    pub preview_width: (f32, f32),
     /// Slot under the cursor while files are dragged over the window.
     pub drop_target: Option<(usize, usize)>,
     /// Media the opened project points to but that is not on disk.
@@ -84,6 +106,8 @@ pub struct UiState {
     pub confirm_quit: bool,
     /// Audio output devices (refreshed when the Composition panel opens).
     pub audio_devices: Vec<(String, u16)>,
+    /// Windows default output device (read with `audio_devices`).
+    pub default_audio_device: Option<String>,
     /// Sound outputs of this laptop (settings.json); `audio_dirty` = main saves them.
     pub audio: crate::audioset::AudioSettings,
     pub audio_dirty: bool,
@@ -107,7 +131,6 @@ pub struct UiState {
     pub unlock: crate::lock::Unlock,
     /// Peak-hold state of each layer's mini meter.
     pub layer_holds: Vec<[crate::meters::Hold; 2]>,
-    pub master_holds: [crate::meters::Hold; 2],
     /// BLACKOUT is on (outputs fading / faded to black).
     pub blackout: bool,
     /// The Preview clip is paused (from the last snapshot).
@@ -127,15 +150,23 @@ pub struct UiState {
     pub tl_last_seek_at: f64,
     /// I / O pressed: set start (true) / end (false) once the snapshot is at hand.
     pub pending_mark: Option<bool>,
-    /// Per layer: the sequence playing on it.
-    pub runs: Vec<Option<crate::sequence::SeqRun>>,
-    /// Shift+click multi-selection (slots of one layer).
+    /// Chains playing, and the UI clock they run on (seconds, set every frame).
+    pub layer_runs: Vec<crate::chain::LayerRun>,
+    pub scene_run: Option<crate::chain::SceneRun>,
+    pub now: f64,
+    /// Shift+click multi-selection: slots of one column, and scene headers.
     pub multi: Vec<(usize, usize)>,
-    /// Per layer: the engine's `queue_taken` of the last snapshot.
-    pub last_taken: Vec<u64>,
-    pub last_failed: Vec<u64>,
+    pub multi_scenes: Vec<usize>,
     /// Scene being renamed: (column, name typed so far).
     pub rename_scene: Option<(usize, String)>,
+    pub confirm_delete: Option<Delete>,
+    /// Eyedropper armed (Pick pressed), and the engine's answer being waited for.
+    pub eyedrop: Option<Eyedrop>,
+    eyedrop_reply: Option<(Eyedrop, std::sync::mpsc::Receiver<Option<[f32; 3]>>)>,
+    /// Program and Preview monitor pictures, and the clip effect editor's widgets, of the last
+    /// frame (eyedropper clicks, tests).
+    pub monitor_rects: [Option<Rect>; 2],
+    pub fx_rects: Vec<(String, Rect)>,
     /// Presentations being imported: source file → (deck, layer, column) of its slot.
     pub importing: std::collections::HashMap<PathBuf, (usize, usize, usize)>,
     /// Imports that failed (source file → error), shown on the slot.
@@ -206,6 +237,10 @@ impl UiState {
             output_open: false,
             status: String::new(),
             slot_rects: Vec::new(),
+            scene_rects: Vec::new(),
+            clear_rects: Vec::new(),
+            layer_name_rects: Vec::new(),
+            preview_width: (0.0, 0.0),
             drop_target: None,
             missing: Vec::new(),
             recovery: None,
@@ -222,6 +257,7 @@ impl UiState {
             jobs: Vec::new(),
             confirm_quit: false,
             audio_devices: Vec::new(),
+            default_audio_device: None,
             audio: Default::default(),
             audio_dirty: false,
             audio_refused: false,
@@ -237,7 +273,6 @@ impl UiState {
             locked: false,
             unlock: Default::default(),
             layer_holds: Vec::new(),
-            master_holds: Default::default(),
             blackout: false,
             cue_paused: false,
             last_saved: None,
@@ -249,11 +284,17 @@ impl UiState {
             tl_last_seek: -1.0,
             tl_last_seek_at: f64::NEG_INFINITY,
             pending_mark: None,
-            runs: vec![None; n],
+            layer_runs: Vec::new(),
+            scene_run: None,
+            now: 0.0,
             multi: Vec::new(),
-            last_taken: Vec::new(),
-            last_failed: Vec::new(),
+            multi_scenes: Vec::new(),
             rename_scene: None,
+            confirm_delete: None,
+            eyedrop: None,
+            eyedrop_reply: None,
+            monitor_rects: [None, None],
+            fx_rects: Vec::new(),
             importing: Default::default(),
             import_errors: Default::default(),
         }
@@ -290,7 +331,8 @@ impl UiState {
 
     /// PANIC: every layer off, the panic media full-frame on layer 1, all sound faded out.
     pub fn panic(&mut self, act: &mut Actions) {
-        self.runs.iter_mut().for_each(|r| *r = None);
+        self.layer_runs.clear();
+        self.scene_run = None;
         for layer in 0..self.project.composition.layers.len() {
             act.commands.push(Command::Clear { layer, transition: None });
             if let Some(p) = self.playing.get_mut(layer) {
@@ -353,16 +395,7 @@ impl UiState {
             ShowOutputs => crate::dock::toggle(&mut self.layout, crate::dock::Panel::Outputs),
             MarkIn => self.pending_mark = Some(true),
             MarkOut => self.pending_mark = Some(false),
-            SeqNext => {
-                // The selected slot's layer, else the top layer that runs a sequence.
-                let sel = match self.selected {
-                    Selection::Slot(l, _) => Some(l).filter(|l| self.runs.get(*l).is_some_and(Option::is_some)),
-                    _ => None,
-                };
-                if let Some(l) = sel.or_else(|| (0..self.runs.len()).rev().find(|l| self.runs[*l].is_some())) {
-                    crate::sequence::next_now(self, l, act);
-                }
-            }
+            SeqNext => crate::chain::next_now(self, act),
             New | Open if !content => self.status = "Locked: unlock to open or create a show".into(),
             New | Open | Save | SaveAs => act.app.push(a),
             AddColumn | AddLayer => self.status = "Locked: unlock to add columns or layers".into(),
@@ -402,51 +435,76 @@ impl UiState {
         self.show_welcome = true;
     }
 
+    /// A slot goes to Program; a slot of a layer chain starts the chain there.
     pub fn trigger(&mut self, layer: usize, col: usize, act: &mut Actions) {
         let deck = self.project.active_deck;
-        if let Some(clip) = self.project.deck().and_then(|d| d.clip(layer, col)).cloned() {
-            let layer_props = self.project.composition.layers.get(layer).cloned().unwrap_or_default();
-            let transition = resolve_preset(&self.project.transitions, &clip, self.next_transition.as_deref(), &layer_props).cloned();
-            let had_run = self.runs.get(layer).is_some_and(Option::is_some);
-            let clip = crate::sequence::start(self, layer, col).unwrap_or(clip);
-            act.commands.push(Command::Trigger { layer, clip, transition });
-            // After the Trigger: a Trigger drops the engine's queue.
-            if self.runs.get(layer).is_some_and(Option::is_some) {
-                crate::sequence::queue(self, layer, act);
-            } else if had_run {
-                act.commands.push(Command::QueueNext { layer, clip: None });
-            }
-            if let Some(p) = self.playing.get_mut(layer) {
-                *p = Some((deck, col));
-            }
-            if let Some(c) = self.project.deck_mut().and_then(|d| d.clip_mut(layer, col)).filter(|c| !c.aired) {
-                c.aired = true;
-                self.dirty = true;
+        let Some(clip) = self.project.deck().and_then(|d| d.clip(layer, col)).cloned() else { return };
+        crate::chain::stop_layer(self, layer);
+        if !crate::chain::start_layer_chain(self, deck, col, layer, act) {
+            self.play(deck, layer, col, clip, act);
+        }
+    }
+
+    /// Puts a clip on air as given (the chains call this without stopping themselves).
+    pub(crate) fn play(&mut self, deck: usize, layer: usize, col: usize, clip: Clip, act: &mut Actions) {
+        let layer_props = self.project.composition.layers.get(layer).cloned().unwrap_or_default();
+        let transition = resolve_preset(&self.project.transitions, &clip, self.next_transition.as_deref(), &layer_props).cloned();
+        act.commands.push(Command::Trigger { layer, clip, transition });
+        if let Some(p) = self.playing.get_mut(layer) {
+            *p = Some((deck, col));
+        }
+        if let Some(c) = self.project.decks.get_mut(deck).and_then(|d| d.clip_mut(layer, col)).filter(|c| !c.aired) {
+            c.aired = true;
+            self.dirty = true;
+        }
+    }
+
+    /// A column is a scene: layers without a clip in it are cleared. A scene of a scene chain
+    /// starts the chain there.
+    pub fn trigger_column(&mut self, col: usize, act: &mut Actions) {
+        self.scene_run = None;
+        if !crate::chain::start_scene_chain(self, col, act) {
+            self.show_scene(self.project.active_deck, col, act);
+        }
+    }
+
+    /// Column `col` of `deck` on air; a layer chain in it starts at its first step.
+    pub(crate) fn show_scene(&mut self, deck: usize, col: usize, act: &mut Actions) {
+        for layer in 0..self.project.composition.layers.len() {
+            let d = self.project.decks.get(deck);
+            let first = d.and_then(|d| d.layer_chain_at(layer, col)).map(|(_, ch)| ch.steps[0].layer);
+            let clip = d.and_then(|d| d.clip(layer, col)).cloned();
+            match (first, clip) {
+                (Some(first), _) if first == layer => {
+                    crate::chain::start_layer_chain(self, deck, col, layer, act);
+                }
+                (Some(_), _) => {} // a later step: its chain cleared it and starts it in time
+                (None, Some(clip)) => {
+                    crate::chain::stop_layer_runs(self, layer);
+                    let clip = crate::chain::as_played_on(self, deck, layer, col, clip);
+                    self.play(deck, layer, col, clip, act);
+                }
+                (None, None) => {
+                    crate::chain::stop_layer_runs(self, layer);
+                    self.off(layer, act);
+                }
             }
         }
     }
 
-    /// A column is a scene: layers without a clip in it are cleared.
-    pub fn trigger_column(&mut self, col: usize, act: &mut Actions) {
-        for layer in 0..self.project.composition.layers.len() {
-            if self.project.deck().and_then(|d| d.clip(layer, col)).is_some() {
-                self.trigger(layer, col, act);
-            } else {
-                self.clear(layer, act);
-            }
-        }
+    /// Empties a layer (and stops the chains it plays in).
+    pub fn clear(&mut self, layer: usize, act: &mut Actions) {
+        crate::chain::stop_layer(self, layer);
+        self.off(layer, act);
     }
 
     /// Empties a layer, fading out with the next / layer-default transition.
-    pub fn clear(&mut self, layer: usize, act: &mut Actions) {
+    pub(crate) fn off(&mut self, layer: usize, act: &mut Actions) {
         let layer_props = self.project.composition.layers.get(layer).cloned().unwrap_or_default();
         let transition = resolve_preset(&self.project.transitions, &Clip::default(), self.next_transition.as_deref(), &layer_props).cloned();
         act.commands.push(Command::Clear { layer, transition });
         if let Some(p) = self.playing.get_mut(layer) {
             *p = None;
-        }
-        if let Some(r) = self.runs.get_mut(layer) {
-            *r = None;
         }
     }
 
@@ -499,7 +557,8 @@ impl UiState {
     fn layers_changed(&mut self, act: &mut Actions) {
         let n = self.project.composition.layers.len();
         self.playing.resize(n, None);
-        self.runs = vec![None; n];
+        self.layer_runs.clear();
+        self.scene_run = None;
         act.commands.push(Command::SetLayerCount(n));
         for (i, l) in self.project.composition.layers.iter().enumerate() {
             act.commands.push(Command::SetLayer { layer: i, props: l.clone() });
@@ -507,9 +566,98 @@ impl UiState {
         self.dirty = true;
     }
 
+    /// ⏶ / ⏷: swaps a layer with the one above / below; what plays on them keeps playing.
+    pub fn move_layer(&mut self, layer: usize, up: bool, act: &mut Actions) {
+        let n = self.project.composition.layers.len();
+        let to = if up { layer.checked_sub(1) } else { Some(layer + 1).filter(|&t| t < n) };
+        let Some(to) = to.filter(|_| layer < n) else { return };
+        self.project.move_layer(layer, to);
+        act.commands.push(Command::MoveLayer { from: layer, to });
+        fn swap<T>(v: &mut [T], a: usize, b: usize) {
+            if a < v.len() && b < v.len() {
+                v.swap(a, b);
+            }
+        }
+        swap(&mut self.playing, layer, to);
+        swap(&mut self.layer_holds, layer, to);
+        let f = |l: usize| if l == layer { to } else if l == to { layer } else { l };
+        self.selected = match self.selected {
+            Selection::Slot(l, c) => Selection::Slot(f(l), c),
+            Selection::Layer(l) => Selection::Layer(f(l)),
+            s => s,
+        };
+        self.multi.clear();
+        self.dirty = true;
+    }
+
+    /// Deletes a layer and its clips; the other layers keep playing (only their numbers change).
+    pub fn delete_layer(&mut self, layer: usize, act: &mut Actions) {
+        let n = self.project.composition.layers.len();
+        if n <= 1 || layer >= n {
+            return;
+        }
+        act.commands.push(Command::Clear { layer, transition: None });
+        // Walk the deleted layer to the end; SetLayerCount then drops it.
+        for i in layer..n - 1 {
+            act.commands.push(Command::MoveLayer { from: i, to: i + 1 });
+        }
+        self.project.remove_layer(layer);
+        if layer < self.playing.len() {
+            self.playing.remove(layer);
+        }
+        if layer < self.layer_holds.len() {
+            self.layer_holds.remove(layer);
+        }
+        self.selected = match self.selected {
+            Selection::Slot(l, _) | Selection::Layer(l) if l == layer => Selection::None,
+            Selection::Slot(l, c) if l > layer => Selection::Slot(l - 1, c),
+            Selection::Layer(l) if l > layer => Selection::Layer(l - 1),
+            s => s,
+        };
+        self.multi.clear();
+        self.layers_changed(act);
+    }
+
+    /// Deletes a scene (column) in every deck; its clips on air are cleared first.
+    pub fn delete_scene(&mut self, col: usize, act: &mut Actions) {
+        if self.project.columns() <= 1 || col >= self.project.columns() {
+            return;
+        }
+        for l in 0..self.playing.len() {
+            match self.playing[l] {
+                Some((_, c)) if c == col => self.clear(l, act),
+                Some((d, c)) if c > col => self.playing[l] = Some((d, c - 1)),
+                _ => {}
+            }
+        }
+        self.project.remove_column(col);
+        let shift = |c: usize| (c != col).then(|| if c > col { c - 1 } else { c });
+        self.selected = match self.selected {
+            Selection::Slot(l, c) => shift(c).map_or(Selection::None, |c| Selection::Slot(l, c)),
+            Selection::Scene(c) => shift(c).map_or(Selection::None, Selection::Scene),
+            s => s,
+        };
+        self.multi.clear();
+        self.rename_scene = None;
+        self.dirty = true;
+    }
+
+    /// A question dialog waits for an answer.
+    pub fn asking(&self) -> bool {
+        self.confirm_delete.is_some() || self.confirm_quit || self.confirm_discard.is_some() || self.recovery.is_some() || self.rename_scene.is_some()
+    }
+
     pub(crate) fn is_playing(&self, layer: usize, col: usize) -> bool {
         self.playing.get(layer).copied().flatten() == Some((self.project.active_deck, col))
     }
+}
+
+/// Seconds shown on a slot: an image's own duration, else the file's length once it is read.
+pub(crate) fn slot_secs(clip: &Clip, info: Option<&evj_media::ClipInfo>) -> Option<f64> {
+    if evj_media::image::is_image(&clip.path) && clip.attached.is_none() {
+        return Some(clip.image_secs());
+    }
+    info.map(|i| i.duration).filter(|d| *d > 0.0)
 }
 
 fn time(secs: f64) -> String {
@@ -534,8 +682,13 @@ pub fn draw(
     let typing = ui.ctx().egui_wants_keyboard_input();
     let presenting = st.present.active();
     let events = ui.input(|i| i.events.clone());
+    let asking = st.asking();
     if st.shortcut_armed.is_none() && !st.map_keys {
         for a in crate::shortcuts::resolve(&st.shortcuts, &events, typing) {
+            // A question on screen owns the keyboard; PANIC and BLACKOUT always work.
+            if asking && !matches!(a, crate::shortcuts::AppAction::Panic | crate::shortcuts::AppAction::Blackout) {
+                continue;
+            }
             // A running presentation owns the clicker keys (Space, Enter, B, arrows …).
             let clicker = presenting && st.shortcuts.combo(a).is_some_and(|c| !c.ctrl && !c.alt && crate::present::is_clicker_key(c.key));
             if !clicker {
@@ -548,7 +701,13 @@ pub fn draw(
         crate::timeline::mark(st, snap, start, &mut act);
     }
     crate::present::update(st, snap, &mut act);
-    crate::sequence::update(st, snap, &mut act);
+    let now = ui.input(|i| i.time);
+    crate::chain::update(st, snap, now, &mut act);
+    eyedrop_answer(st, &mut act);
+    if st.eyedrop.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        st.eyedrop = None;
+        st.status = "Eyedropper cancelled".into();
+    }
     st.sync_cue(&mut act);
     top_bar(ui, st, snap, &mut act);
     egui::Panel::bottom("status").show(ui, |ui| {
@@ -604,7 +763,7 @@ pub fn draw(
 }
 
 fn keys(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
-    if ctx.egui_wants_keyboard_input() || st.shortcut_armed.is_some() {
+    if ctx.egui_wants_keyboard_input() || st.shortcut_armed.is_some() || st.asking() {
         return;
     }
     // Ctrl / Alt combos belong to the app shortcuts, never to the project keymap.
@@ -634,7 +793,7 @@ fn keys(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
                 continue;
             } else {
                 st.project.keymap.bind(key.name(), target.clone());
-                st.status = format!("{} → {target:?}", key.name());
+                st.status = format!("{} › {target:?}", key.name());
             }
             st.dirty = true;
         } else if !st.map_keys && st.shortcuts.plain_key(key).is_none() {
@@ -646,77 +805,90 @@ fn keys(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
 }
 
 fn dialogs(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
-    if st.confirm_quit {
-        egui::Window::new("Quit EVJ?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            if st.output_open {
-                ui.label("The audience screens will go black.");
-            }
-            if st.dirty {
-                ui.label("The show has unsaved changes.");
-            }
-            ui.horizontal(|ui| {
-                if st.dirty && ui.button(RichText::new("Save and quit").strong()).clicked() {
-                    act.save_and_quit = true;
-                    st.confirm_quit = false;
-                }
-                if ui.button(if st.dirty { "Quit without saving" } else { "Quit" }).clicked() {
-                    act.quit = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    st.confirm_quit = false;
-                }
-            });
+    use crate::modal::{Tone, ask, note, text};
+    if let Some(d) = st.confirm_delete {
+        let (title, what, button) = match d {
+            Delete::Layer(l) => ("Delete layer?", st.project.composition.layers.get(l).map(|x| x.name.clone()).unwrap_or_default(), "Delete layer"),
+            Delete::Scene(c) => ("Delete scene?", st.project.deck().map(|x| x.scene_name(c)).unwrap_or_default(), "Delete scene"),
+        };
+        let answer = ask(ctx, "confirm_delete", title, Some(0), &[("Cancel", Tone::Plain), (button, Tone::Danger)], |ui| {
+            text(ui, format!("\u{201c}{what}\u{201d} and its clips will be removed from every deck."));
+            note(ui, "Anything of it on Program is cleared first. This cannot be undone.");
         });
+        if let Some(i) = answer {
+            st.confirm_delete = None;
+            // A lock since the question was asked cancels it.
+            if i == 1 && crate::lock::allowed(st.locked, crate::lock::Op::Content) {
+                match d {
+                    Delete::Layer(l) => st.delete_layer(l, act),
+                    Delete::Scene(c) => st.delete_scene(c, act),
+                }
+            }
+        }
+    }
+    if st.confirm_quit {
+        let buttons: &[(&str, Tone)] = if st.dirty {
+            &[("Cancel", Tone::Plain), ("Quit without saving", Tone::Plain), ("Save and quit", Tone::Primary)]
+        } else {
+            &[("Cancel", Tone::Plain), ("Quit", Tone::Danger)]
+        };
+        let (output_open, dirty) = (st.output_open, st.dirty);
+        let answer = ask(ctx, "confirm_quit", "Quit EVJ?", Some(0), buttons, |ui| {
+            if output_open {
+                text(ui, "The audience screens will go black.");
+            }
+            if dirty {
+                text(ui, "The show has unsaved changes.");
+            }
+        });
+        match answer {
+            Some(0) => st.confirm_quit = false,
+            Some(1) => act.quit = true, // Quit / Quit without saving
+            Some(2) => {
+                act.save_and_quit = true;
+                st.confirm_quit = false;
+            }
+            _ => {}
+        }
     }
     if st.confirm_discard.is_some() {
-        egui::Window::new("Unsaved changes").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            ui.label("Save the current show first?");
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new("Save").strong()).clicked() {
-                    act.discard_answer = Some(true);
-                }
-                if ui.button("Don't save").clicked() {
-                    act.discard_answer = Some(false);
-                }
-                if ui.button("Cancel").clicked() {
-                    st.confirm_discard = None;
-                }
-            });
+        let answer = ask(ctx, "confirm_discard", "Save changes first?", Some(0), &[("Cancel", Tone::Plain), ("Don't save", Tone::Plain), ("Save", Tone::Primary)], |ui| {
+            text(ui, "The current show has changes that are not saved yet.");
         });
+        match answer {
+            Some(0) => st.confirm_discard = None,
+            Some(1) => act.discard_answer = Some(false),
+            Some(2) => act.discard_answer = Some(true),
+            _ => {}
+        }
     }
     if st.recovery.is_some() {
-        egui::Window::new("Recover show?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            ui.label("EVJ did not close normally last time. Recover the autosaved show?");
-            ui.horizontal(|ui| {
-                if ui.button("Recover").clicked() {
-                    act.menu = Some(Menu::Recover(true));
-                }
-                if ui.button("Discard").clicked() {
-                    act.menu = Some(Menu::Recover(false));
-                }
-            });
+        let answer = ask(ctx, "recover", "Recover the show?", None, &[("Discard", Tone::Plain), ("Recover", Tone::Primary)], |ui| {
+            text(ui, "EVJ did not close normally last time.");
+            note(ui, "Recover opens the show as it was autosaved.");
         });
+        match answer {
+            Some(0) => act.menu = Some(Menu::Recover(false)),
+            Some(1) => act.menu = Some(Menu::Recover(true)),
+            _ => {}
+        }
     }
     if let Some((c, mut name)) = st.rename_scene.clone() {
-        let mut done = false;
-        egui::Window::new("Rename scene").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            let r = ui.text_edit_singleline(&mut name);
+        let answer = ask(ctx, "rename_scene", "Rename scene", Some(0), &[("Cancel", Tone::Plain), ("Rename", Tone::Primary)], |ui| {
+            let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY).hint_text("Scene name (empty = Scene N)"));
             r.request_focus();
-            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.horizontal(|ui| {
-                if ui.button("OK").clicked() || enter {
-                    if let Some(d) = st.project.deck_mut() {
-                        d.set_scene_name(c, &name);
-                    }
-                    st.dirty = true;
-                    done = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    done = true;
-                }
-            });
         });
-        st.rename_scene = if done { None } else { Some((c, name)) };
+        st.rename_scene = match answer {
+            Some(1) => {
+                if let Some(d) = st.project.deck_mut() {
+                    d.set_scene_name(c, &name);
+                }
+                st.dirty = true;
+                None
+            }
+            Some(_) => None,
+            None => Some((c, name)),
+        };
     }
     if !st.missing.is_empty() {
         let mut open = true;
@@ -864,19 +1036,90 @@ fn top_bar(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, act: &mut Actio
 }
 
 /// A monitor picture at full panel width (black box while there is nothing to show).
-fn monitor_image(ui: &mut egui::Ui, tex: Option<(egui::TextureId, [f32; 2])>, show: bool) {
+/// `max_h`: the picture never takes more than this height (the rows under it stay visible);
+/// it is centred when the height, not the width, limits it.
+/// While the eyedropper is armed, a click on a monitor asks the engine for the clip's colour there.
+fn eyedrop_click(ui: &mut egui::Ui, st: &mut UiState, rect: Rect, program: bool, act: &mut Actions) {
+    let Some(e) = st.eyedrop else { return };
+    let resp = ui.interact(rect, ui.id().with(("eyedrop", program)), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+    let Some(p) = resp.clicked().then(|| resp.interact_pointer_pos()).flatten() else { return };
+    let pos = [((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0), ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0)];
+    let here = e.deck == st.project.active_deck;
+    let at = if program {
+        if !(here && st.is_playing(e.layer, e.col)) {
+            st.status = "This clip is not on Program — click its colour on the Preview".into();
+            return;
+        }
+        evj_engine::PickAt::Program(e.layer)
+    } else {
+        if !(here && st.selected == Selection::Slot(e.layer, e.col)) {
+            st.status = "The Preview shows another clip — select this clip again".into();
+            return;
+        }
+        evj_engine::PickAt::Preview
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    act.commands.push(Command::PickColor { at, pos, reply: tx });
+    st.eyedrop = None;
+    st.eyedrop_reply = Some((e, rx));
+}
+
+/// The engine's answer to an eyedropper click: the colour becomes the effect's key colour.
+fn eyedrop_answer(st: &mut UiState, act: &mut Actions) {
+    use std::sync::mpsc::TryRecvError;
+    let Some((e, rx)) = st.eyedrop_reply.take() else { return };
+    let rgb = match rx.try_recv() {
+        Ok(Some(rgb)) => rgb,
+        Ok(None) => {
+            st.status = "That click was beside the clip — press Pick and try again".into();
+            return;
+        }
+        Err(TryRecvError::Empty) => {
+            st.eyedrop_reply = Some((e, rx));
+            return;
+        }
+        Err(TryRecvError::Disconnected) => return,
+    };
+    if !crate::lock::allowed(st.locked, crate::lock::Op::Content) {
+        return;
+    }
+    let Some(clip) = st.project.decks.get_mut(e.deck).and_then(|d| d.clip_mut(e.layer, e.col)) else { return };
+    let Some(fx) = clip.effects.get_mut(e.effect) else { return };
+    for (k, v) in ["key_r", "key_g", "key_b"].iter().zip(rgb) {
+        fx.param_mut(k, 0.0).value = v as f64;
+    }
+    let clip = clip.clone();
+    st.dirty = true;
+    st.status = format!("Key colour picked: R {:.0} G {:.0} B {:.0}", rgb[0] * 255.0, rgb[1] * 255.0, rgb[2] * 255.0);
+    if e.deck == st.project.active_deck && st.is_playing(e.layer, e.col) {
+        let clip = crate::chain::as_played(st, e.layer, e.col, clip);
+        act.commands.push(Command::UpdateClip { layer: e.layer, clip });
+    }
+}
+
+fn monitor_image(ui: &mut egui::Ui, tex: Option<(egui::TextureId, [f32; 2])>, show: bool, max_h: f32) -> Rect {
     let w = ui.available_width();
     let aspect = tex.map_or(16.0 / 9.0, |(_, s)| s[0] / s[1].max(1.0));
-    let size = vec2(w, w / aspect);
-    match tex.filter(|_| show) {
-        Some((id, _)) => {
-            ui.image((id, size));
+    let h = (w / aspect).min(max_h.max(60.0));
+    let size = vec2(h * aspect, h);
+    let pad = (w - size.x).max(0.0) / 2.0;
+    ui.horizontal(|ui| {
+        ui.add_space(pad);
+        let (r, _) = ui.allocate_exact_size(size, Sense::hover());
+        match tex.filter(|_| show) {
+            Some((id, _)) => {
+                ui.painter().image(id, r, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            None => {
+                ui.painter().rect_filled(r, 2.0, Color32::BLACK);
+            }
         }
-        None => {
-            let (r, _) = ui.allocate_exact_size(size, Sense::hover());
-            ui.painter().rect_filled(r, 2.0, Color32::BLACK);
-        }
-    }
+        r
+    })
+    .inner
 }
 
 /// Small filled circle (tally light) — the default fonts have no U+25CF.
@@ -897,27 +1140,23 @@ pub(crate) fn program_panel(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot
             }
         });
     });
-    let now = ui.input(|i| i.time);
-    ui.horizontal(|ui| {
-        let w = ui.available_width() - 26.0;
-        let aspect = program.map_or(16.0 / 9.0, |(_, s)| s[0] / s[1].max(1.0));
-        ui.allocate_ui(vec2(w, w / aspect), |ui| {
-            monitor_image(ui, program, true);
-            if snap.blackout > 0.0 {
-                let r = ui.min_rect();
-                ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha((snap.blackout * 255.0) as u8));
-                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "BLACKOUT", egui::FontId::proportional(18.0), Color32::from_rgb(235, 60, 60));
-            }
-        });
-        ui.vertical(|ui| {
-            crate::meters::vmeter(ui, snap.master_peaks, &mut st.master_holds, now, (w / aspect - 40.0).max(40.0));
-        });
-    });
+    // Room under the picture for every layer on air (one row each).
+    let rows = snap.layers.iter().filter(|l| crate::transport::on_air(l)).count().max(1) as f32;
+    let r = monitor_image(ui, program, true, ui.available_height() - 12.0 - rows * 26.0);
+    st.monitor_rects[0] = Some(r);
+    eyedrop_click(ui, st, r, true, act);
+    if snap.blackout > 0.0 {
+        ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha((snap.blackout * 255.0) as u8));
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "BLACKOUT", egui::FontId::proportional(18.0), Color32::from_rgb(235, 60, 60));
+    }
     crate::transport::program_strip(ui, st, snap, act);
 }
 
 /// The Preview panel: the cued clip / scene, TAKE, its transport and its sound.
-pub(crate) fn preview_panel(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, cue: Option<(egui::TextureId, [f32; 2])>, act: &mut Actions) {
+/// The Preview panel: the cued clip / scene, TAKE, transport, its sound, its timeline (seek,
+/// start / end, loop, attached audio) and its settings (effects …).
+pub(crate) fn preview_panel(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, cue: Option<(egui::TextureId, [f32; 2])>, thumbs: &mut Thumbnailer, waves: &mut crate::waveform::Waveforms, act: &mut Actions) {
+    let avail = ui.available_width();
     let cued = match st.selected {
         Selection::Slot(l, c) => st.project.deck().and_then(|d| d.clip(l, c)).map(|clip| format!("{} · layer {}", clip.name, l + 1)),
         Selection::Scene(c) => {
@@ -929,25 +1168,31 @@ pub(crate) fn preview_panel(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot
     ui.horizontal(|ui| {
         dot(ui, Color32::from_rgb(60, 200, 90));
         ui.label(RichText::new("PREVIEW").strong().color(Color32::from_rgb(60, 200, 90)));
-        match &cued {
-            Some(text) => ui.label(RichText::new(text).small()),
-            None => ui.label(RichText::new("click a clip or a scene to cue it").small().weak()),
-        };
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let take_key = st.shortcuts.combo(crate::shortcuts::AppAction::Take).map(|c| format!(" ({c})")).unwrap_or_default();
             let take = ui.add_enabled(cued.is_some(), egui::Button::new(RichText::new("TAKE ▶").strong())).on_hover_text(format!("Put the Preview on Program (with the next / layer transition){take_key}"));
             if take.clicked() {
                 st.run_app_action(crate::shortcuts::AppAction::Take, act);
             }
+            // The name gets what is left (long names end in "…"; hover shows it whole).
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                match &cued {
+                    Some(text) => ui.add(egui::Label::new(RichText::new(text).small()).truncate()).on_hover_text(text),
+                    None => ui.add(egui::Label::new(RichText::new("click a clip or a scene to cue it").small().weak()).truncate()),
+                };
+            });
         });
     });
-    monitor_image(ui, cue, cued.is_some() && snap.cue.is_some());
+    // At most about half the panel: transport, timeline and clip settings follow.
+    let r = monitor_image(ui, cue, cued.is_some() && snap.cue.is_some(), (ui.available_height() * 0.5).max(120.0));
+    st.monitor_rects[1] = Some(r);
+    eyedrop_click(ui, st, r, false, act);
     crate::transport::preview_controls(ui, st, snap, act);
     ui.horizontal(|ui| {
-        let hover = snap.preview_audio_device.clone().unwrap_or_else(|| "Preview audio off — Composition → Audio outputs".into());
+        let hover = snap.preview_audio_device.clone().unwrap_or_else(|| "Preview audio off — Composition › Audio outputs".into());
         ui.label("🎧").on_hover_text(hover);
         if st.audio.preview.is_none() {
-            ui.label(RichText::new("Preview audio off — Composition → Audio outputs").small().weak());
+            ui.label(RichText::new("Preview audio off — Composition › Audio outputs").small().weak());
         } else {
             if crate::widgets::volume_fader(ui, &mut st.audio.preview_volume) {
                 act.commands.push(Command::SetPreviewVolume(st.audio.preview_volume));
@@ -957,10 +1202,102 @@ pub(crate) fn preview_panel(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot
             crate::meters::hmeter(ui, snap.preview_peaks, &mut st.preview_holds, now, 120.0);
         }
     });
+    ui.separator();
+    crate::timeline::panel(ui, st, snap, waves, thumbs, act);
+    if let Selection::Slot(l, c) = st.selected {
+        ui.separator();
+        egui::CollapsingHeader::new(RichText::new("Clip settings & effects").strong()).id_salt("clip_settings").default_open(true).show(ui, |ui| {
+            clip_props(ui, st, thumbs, snap, l, c, act);
+        });
+    }
+    chain_settings(ui, st);
+    st.preview_width = (ui.min_rect().width(), avail);
 }
 
 
+/// Preview panel: the chains of the selected slot / scene.
+fn chain_settings(ui: &mut egui::Ui, st: &mut UiState) {
+    let deck = st.project.active_deck;
+    let (slot, col) = match st.selected {
+        Selection::Slot(l, c) => (Some(l), c),
+        Selection::Scene(c) => (None, c),
+        _ => return,
+    };
+    let Some(d) = st.project.deck() else { return };
+    let layer_chain = slot.and_then(|l| d.layer_chain_at(l, col)).map(|(i, ch)| (i, ch.clone()));
+    let scene_chain = d.scene_chain_at(col).map(|(i, ch)| (i, ch.clone()));
+    if layer_chain.is_none() && scene_chain.is_none() {
+        return;
+    }
+    let content = crate::lock::allowed(st.locked, crate::lock::Op::Content);
+    ui.separator();
+    egui::CollapsingHeader::new(RichText::new("Chain").strong()).id_salt("chain_settings").default_open(true).show(ui, |ui| {
+        ui.add_enabled_ui(content, |ui| {
+            if let Some((i, mut ch)) = layer_chain {
+                ui.label(RichText::new("Layer chain — these layers of the scene start one after another").color(chain_color(i)));
+                let before = ch.clone();
+                // One wrapping row per step: fits a narrow Preview tab.
+                for (k, step) in ch.steps.iter_mut().enumerate() {
+                    let name = st.project.composition.layers.get(step.layer).map(|l| l.name.clone()).unwrap_or_default();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(format!("{}. {name}", k + 1)).color(layer_color(step.layer)));
+                        if k == 0 {
+                            ui.label(RichText::new("starts the chain").weak());
+                            return;
+                        }
+                        let timed = matches!(step.start, StepStart::AfterSecs(_));
+                        if ui.selectable_label(!timed, "when the one before ends").clicked() {
+                            step.start = StepStart::AfterPrevious;
+                        }
+                        if ui.selectable_label(timed, "after").on_hover_text("N seconds after the one before started").clicked() && !timed {
+                            step.start = StepStart::AfterSecs(10.0);
+                        }
+                        if let StepStart::AfterSecs(n) = &mut step.start {
+                            ui.add(egui::DragValue::new(n).range(0.0..=3600.0).speed(0.1).suffix(" s"));
+                        }
+                        ui.label("·");
+                        ui.selectable_value(&mut step.mode, StepMode::Replace, "Replace").on_hover_text("Clear the one before");
+                        ui.selectable_value(&mut step.mode, StepMode::Overlay, "Overlay 🗗").on_hover_text("Keep the one before playing");
+                    });
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(&mut ch.looping, false, "■ Stop at the end");
+                    ui.radio_value(&mut ch.looping, true, "⟲ Loop (clear, start again)");
+                });
+                if ch != before {
+                    crate::chain::edit_layer_chain(st, deck, i, ch);
+                }
+                if ui.button("Break layer chain").clicked() {
+                    st.project.decks[deck].break_layer_chain(i);
+                    st.dirty = true;
+                }
+            }
+            if let Some((i, mut ch)) = scene_chain {
+                ui.add_space(4.0);
+                let list = ch.cols.iter().map(|c| format!("{}", c + 1)).collect::<Vec<_>>().join(" › ");
+                ui.label(RichText::new(format!("Scene chain: scenes {list}")).color(chain_color(i)));
+                ui.label(RichText::new("The next scene starts when the longest clip ends; A–B loops and looping layer chains wait for ⏭ Next.").small().weak());
+                let before = ch.clone();
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(&mut ch.looping, false, "■ Stop at the end");
+                    ui.radio_value(&mut ch.looping, true, "⟲ Loop");
+                });
+                if ch != before {
+                    crate::chain::edit_scene_chain(st, deck, i, ch);
+                }
+                if ui.button("Break scene chain").clicked() {
+                    st.project.decks[deck].break_scene_chain(i);
+                    st.dirty = true;
+                }
+            }
+        });
+    });
+}
+
 const SLOT: egui::Vec2 = egui::Vec2::new(thumbs::W as f32 * 0.75, thumbs::H as f32 * 0.75);
+/// Width of the layer controls column; the scene header row starts with the same width so the
+/// headers sit exactly above their slots.
+const LAYER_COL: f32 = 200.0;
 
 pub(crate) fn grid(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, thumbs: &mut Thumbnailer, act: &mut Actions) {
     let content = crate::lock::allowed(st.locked, crate::lock::Op::Content);
@@ -1005,50 +1342,85 @@ pub(crate) fn grid(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, thumbs:
     });
     ui.separator();
     st.slot_rects.clear();
+    st.scene_rects.clear();
+    st.clear_rects.clear();
+    st.layer_name_rects.clear();
     let cols = st.project.columns();
     let layers = st.project.composition.layers.len();
-    egui::ScrollArea::both().show(ui, |ui| {
-        // Scene headers: 1 click = the whole column on Preview, double-click = Program.
-        ui.horizontal(|ui| {
-            ui.add_sized(vec2(200.0, 22.0), egui::Label::new("Layer"));
-            for c in 0..cols {
-                scene_header(ui, st, c, act);
-            }
-            if ui.add_enabled(content, egui::Button::new("+ Column")).clicked() {
-                st.project.add_column();
-                st.dirty = true;
-            }
-        });
-        for layer in (0..layers).rev() {
-            ui.horizontal(|ui| {
-                layer_controls(ui, st, snap, layer, act);
-                for col in 0..cols {
-                    slot(ui, st, thumbs, layer, col, act);
+    // The layer column stays put; only the slots (and their scene headers) scroll sideways.
+    // Scrolling down moves both, so every layer row stays beside its slots.
+    egui::ScrollArea::vertical().id_salt("grid_rows").show(ui, |ui| {
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.add_sized(vec2(LAYER_COL, 22.0), egui::Label::new("Layer"));
+                for layer in 0..layers {
+                    layer_controls(ui, st, snap, layer, act);
+                }
+                if ui.add_enabled(content, egui::Button::new("+ Layer")).clicked() {
+                    st.project.add_layer();
+                    st.layers_changed(act);
                 }
             });
-        }
-        ui.horizontal(|ui| {
-            if ui.add_enabled(content, egui::Button::new("+ Layer")).clicked() {
-                st.project.add_layer();
-                st.layers_changed(act);
-            }
+            egui::ScrollArea::horizontal().id_salt("grid_slots").show(ui, |ui| {
+                ui.vertical(|ui| {
+                    // Scene headers: 1 click = the whole column on Preview, double-click = Program.
+                    ui.horizontal(|ui| {
+                        for c in 0..cols {
+                            scene_header(ui, st, c, act);
+                        }
+                        if ui.add_enabled(content, egui::Button::new("+ Column")).clicked() {
+                            st.project.add_column();
+                            st.dirty = true;
+                        }
+                    });
+                    for layer in 0..layers {
+                        ui.horizontal(|ui| {
+                            for col in 0..cols {
+                                slot(ui, st, thumbs, layer, col, act);
+                            }
+                        });
+                    }
+                });
+            });
         });
     });
 }
 
+/// A keyboard shortcut on a slot / scene: black on yellow, easy to read on any thumbnail.
+fn key_badge(painter: &egui::Painter, top_right: egui::Pos2, key: &str) {
+    let galley = painter.layout_no_wrap(key.to_string(), egui::FontId::monospace(13.0), Color32::BLACK);
+    let size = galley.size() + vec2(8.0, 2.0);
+    let r = Rect::from_min_size(top_right - vec2(size.x, 0.0), size);
+    painter.rect_filled(r, 3.0, Color32::from_rgb(255, 205, 40));
+    painter.rect_stroke(r, 3.0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Inside);
+    painter.galley(r.min + vec2(4.0, 1.0), galley, Color32::BLACK);
+}
+
 fn scene_header(ui: &mut egui::Ui, st: &mut UiState, c: usize, act: &mut Actions) {
     let (rect, resp) = ui.allocate_exact_size(vec2(SLOT.x, 22.0), Sense::click());
+    st.scene_rects.push((rect, c));
     let a = Action::TriggerColumn(c);
     let name = st.project.deck().map(|d| d.scene_name(c)).unwrap_or_default();
     let layers = st.project.composition.layers.len();
     let filled: Vec<usize> = (0..layers).filter(|&l| st.project.deck().and_then(|d| d.clip(l, c)).is_some()).collect();
     let on_air = !filled.is_empty() && filled.iter().all(|&l| st.is_playing(l, c));
+    let chain = st.project.deck().and_then(|d| d.scene_chain_at(c)).map(|(i, ch)| (i, ch.clone()));
     let painter = ui.painter();
     painter.rect_filled(rect, 3.0, Color32::from_gray(if filled.is_empty() { 30 } else { 40 }));
     let text = if filled.is_empty() { Color32::from_gray(110) } else { Color32::from_gray(225) };
-    painter.text(rect.left_center() + vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(12.0), text);
+    // Scene chain: a band along the bottom, the step number before the name.
+    let mut x = rect.left() + 6.0;
+    if let Some((i, ch)) = &chain {
+        let color = chain_color(*i);
+        let k = ch.cols.iter().position(|&x| x == c).unwrap_or(0);
+        let tag = if k == 0 { format!("1{}", if ch.looping { "⟲" } else { "■" }) } else { format!("{}", k + 1) };
+        let r = painter.text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, tag, egui::FontId::monospace(11.0), color);
+        x = r.right() + 5.0;
+        painter.rect_filled(Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 3.0), rect.right_bottom()), 0.0, color);
+    }
+    painter.text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(12.0), text);
     if let Some(k) = st.key_label(&a) {
-        painter.text(rect.right_center() - vec2(5.0, 0.0), egui::Align2::RIGHT_CENTER, k, egui::FontId::monospace(11.0), Color32::from_rgb(255, 210, 90));
+        key_badge(painter, rect.right_top() + vec2(-3.0, 2.0), &k);
     }
     let stroke = if st.map_target == Some(a.clone()) {
         Stroke::new(2.0, Color32::from_rgb(255, 150, 40))
@@ -1056,6 +1428,8 @@ fn scene_header(ui: &mut egui::Ui, st: &mut UiState, c: usize, act: &mut Actions
         Stroke::new(2.0, Color32::from_rgb(235, 60, 60)) // PROGRAM tally
     } else if st.selected == Selection::Scene(c) {
         Stroke::new(2.0, Color32::from_rgb(60, 200, 90)) // PREVIEW tally
+    } else if st.multi_scenes.contains(&c) {
+        Stroke::new(2.0, Color32::from_rgb(80, 200, 255)) // shift-click selection
     } else if resp.hovered() {
         Stroke::new(1.0, Color32::from_gray(140))
     } else {
@@ -1068,9 +1442,13 @@ fn scene_header(ui: &mut egui::Ui, st: &mut UiState, c: usize, act: &mut Actions
     } else if resp.clicked() {
         if st.map_keys {
             st.click(a.clone(), act);
+        } else if !filled.is_empty() && ui.input(|i| i.modifiers.shift) {
+            crate::chain::toggle_scene(st, c);
+            st.status = format!("{} scene(s) selected — right-click › Chain scenes", st.multi_scenes.len());
         } else if !filled.is_empty() {
             st.selected = Selection::Scene(c);
             st.multi.clear();
+            st.multi_scenes.clear();
             st.status = format!("{name} on PREVIEW — TAKE (Enter) or double-click to put it live");
         }
     }
@@ -1085,23 +1463,90 @@ fn scene_header(ui: &mut egui::Ui, st: &mut UiState, c: usize, act: &mut Actions
             st.rename_scene = Some((c, name.clone()));
             ui.close();
         }
+        let picked = st.multi_scenes.len() >= 2 && st.multi_scenes.contains(&c);
+        let label = if picked { format!("Chain scenes ({})", st.multi_scenes.len()) } else { "Chain scenes…".to_string() };
+        let chain_b = ui.add_enabled(content && picked, egui::Button::new(label));
+        if !picked {
+            ui.label(RichText::new("Shift+click 2 or more scene headers (or slots of different scenes) first").small().weak());
+        }
+        if chain_b.clicked() {
+            let cols = std::mem::take(&mut st.multi_scenes);
+            if st.project.deck_mut().is_some_and(|d| d.make_scene_chain(&cols)) {
+                st.status = "Scenes chained — play the first one; each starts when the one before ends".into();
+                st.dirty = true;
+            }
+            ui.close();
+        }
+        if let Some((i, _)) = chain.as_ref().filter(|_| content) {
+            if ui.button("Break scene chain").clicked() {
+                if let Some(d) = st.project.deck_mut() {
+                    d.break_scene_chain(*i);
+                }
+                st.dirty = true;
+                ui.close();
+            }
+        }
+        if content && st.project.columns() > 1 && ui.button("Delete scene…").clicked() {
+            st.confirm_delete = Some(Delete::Scene(c));
+            ui.close();
+        }
     });
+}
+
+/// A layer's right-click menu (its name, or anywhere on its controls).
+fn layer_menu(ui: &mut egui::Ui, content: bool, layer: usize, n: usize, moved: &mut Option<bool>, delete: &mut bool) {
+    if ui.add_enabled(content && layer > 0, egui::Button::new("Move up")).clicked() {
+        *moved = Some(true);
+        ui.close();
+    }
+    if ui.add_enabled(content && layer + 1 < n, egui::Button::new("Move down")).clicked() {
+        *moved = Some(false);
+        ui.close();
+    }
+    ui.separator();
+    let del = ui.add_enabled(content && n > 1, egui::Button::new("Delete layer…"));
+    let del = if n <= 1 { del.on_disabled_hover_text("The last layer stays") } else { del.on_disabled_hover_text("Locked: unlock to delete") };
+    if del.clicked() {
+        *delete = true;
+        ui.close();
+    }
 }
 
 fn layer_controls(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, layer: usize, act: &mut Actions) {
     let state = snap.layers.get(layer).cloned().unwrap_or_default();
-    ui.allocate_ui(vec2(200.0, SLOT.y + 16.0), |ui| {
+    ui.allocate_ui(vec2(LAYER_COL, SLOT.y + 16.0), |ui| {
+        // Under the controls (registered first, so they stay on top): right-click opens the layer menu.
+        let block = Rect::from_min_size(ui.max_rect().min, vec2(LAYER_COL, SLOT.y + 16.0));
+        let block = ui.interact(block, ui.id().with(("layer_block", layer)), Sense::click());
         ui.vertical(|ui| {
+            ui.set_width(LAYER_COL); // exactly the header's width, whatever the controls need
+            ui.set_height(SLOT.y + 16.0); // exactly a slot row, so the rows beside it line up
             let clear_key = st.key_label(&Action::ClearLayer(layer)).map(|k| format!(" {k}")).unwrap_or_default();
             let selected = st.selected == Selection::Layer(layer);
-            let (mut select, mut clear) = (false, false);
+            let content = crate::lock::allowed(st.locked, crate::lock::Op::Content);
+            let n = st.project.composition.layers.len();
+            let (mut select, mut clear, mut delete) = (false, false, false);
+            let mut moved: Option<bool> = None;
+            let mut name_rect = None;
+            let mut clear_rect = None;
             let l = &mut st.project.composition.layers[layer];
             let before = l.clone();
             ui.horizontal(|ui| {
-                select = ui.selectable_label(selected, &l.name).clicked();
+                let name = ui.selectable_label(selected, &l.name).on_hover_text("Right-click: move / delete layer");
+                name_rect = Some(name.rect);
+                select = name.clicked();
+                name.context_menu(|ui| layer_menu(ui, content, layer, n, &mut moved, &mut delete));
+                if ui.add_enabled(content && layer > 0, egui::Button::new("⏶").small()).on_hover_text("Move up (drawn above)").clicked() {
+                    moved = Some(true);
+                }
+                if ui.add_enabled(content && layer + 1 < n, egui::Button::new("⏷").small()).on_hover_text("Move down (drawn below)").clicked() {
+                    moved = Some(false);
+                }
                 ui.toggle_value(&mut l.bypass, "B").on_hover_text("Bypass");
                 ui.toggle_value(&mut l.solo, "S").on_hover_text("Solo");
-                clear = ui.button(format!("✖{clear_key}")).on_hover_text("Clear layer").clicked();
+                let b = ui.button(format!("✖{clear_key}")).on_hover_text("Clear layer");
+                clear_rect = Some(b.rect);
+                clear = b.clicked();
             });
             crate::widgets::opacity_bar(ui, &mut l.opacity, layer_color(layer));
             ui.horizontal(|ui| {
@@ -1120,8 +1565,21 @@ fn layer_controls(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, layer: u
             if select {
                 st.selected = Selection::Layer(layer);
             }
+            if let Some(r) = clear_rect {
+                st.clear_rects.push((r, layer));
+            }
+            if let Some(r) = name_rect {
+                st.layer_name_rects.push((r, layer));
+            }
             if clear {
                 st.click(Action::ClearLayer(layer), act);
+            }
+            block.context_menu(|ui| layer_menu(ui, content, layer, n, &mut moved, &mut delete));
+            if delete {
+                st.confirm_delete = Some(Delete::Layer(layer));
+            }
+            if let Some(up) = moved {
+                st.move_layer(layer, up, act);
             }
             let line = match (&state.error, &state.clip_name) {
                 (Some(e), _) => egui::RichText::new(e).color(Color32::LIGHT_RED),
@@ -1151,18 +1609,21 @@ fn slot(ui: &mut egui::Ui, st: &mut UiState, thumbs: &mut Thumbnailer, layer: us
             }
             Thumb::Pending => {}
         }
-        let text_pos = egui::pos2(rect.min.x + 3.0, rect.max.y - 14.0);
-        painter.text(text_pos, egui::Align2::LEFT_TOP, &c.name, egui::FontId::proportional(11.0), Color32::from_gray(220));
-    }
-    if clip.as_ref().is_some_and(|c| c.audio && thumbs.info(&c.path).is_some_and(|i| i.has_audio)) {
-        painter.text(rect.left_top() + vec2(4.0, 3.0), egui::Align2::LEFT_TOP, "♪", egui::FontId::proportional(12.0), Color32::from_rgb(120, 230, 200));
+        // Under the picture: ♪ when the clip plays its own sound, then its name.
+        let sound = c.audio && thumbs.info(&c.path).is_some_and(|i| i.has_audio);
+        let mut x = rect.min.x + 3.0;
+        if sound {
+            painter.text(egui::pos2(x, rect.max.y - 15.0), egui::Align2::LEFT_TOP, "♪", egui::FontId::proportional(12.0), Color32::from_rgb(120, 230, 200));
+            x += 13.0;
+        }
+        painter.text(egui::pos2(x, rect.max.y - 14.0), egui::Align2::LEFT_TOP, &c.name, egui::FontId::proportional(11.0), Color32::from_gray(220));
     }
     // CPU-decoded (FFmpeg fallback): works, but costs CPU — Convert to HAP is the cure.
     if clip.as_ref().is_some_and(|c| thumbs.info(&c.path).is_some_and(|i| i.kind == DecoderKind::Ffmpeg)) {
         painter.text(rect.left_top() + vec2(18.0, 3.0), egui::Align2::LEFT_TOP, "HEAVY", egui::FontId::proportional(10.0), Color32::from_rgb(255, 150, 40));
     }
-    if let Some(i) = clip.as_ref().and_then(|c| thumbs.info(&c.path)).filter(|i| i.duration > 0.0) {
-        let d = crate::transport::clock(i.duration);
+    if let Some(secs) = clip.as_ref().and_then(|c| slot_secs(c, thumbs.info(&c.path))) {
+        let d = crate::transport::clock(secs);
         let galley = painter.layout_no_wrap(d, egui::FontId::monospace(10.0), Color32::from_gray(235));
         let at = img.right_bottom() + vec2(-4.0 - galley.size().x, -3.0 - galley.size().y);
         painter.rect_filled(Rect::from_min_size(at - vec2(3.0, 1.0), galley.size() + vec2(6.0, 2.0)), 3.0, Color32::from_black_alpha(170));
@@ -1186,16 +1647,34 @@ fn slot(ui: &mut egui::Ui, st: &mut UiState, thumbs: &mut Thumbnailer, layer: us
         painter.text(rect.right_top() + vec2(-4.0, 16.0), egui::Align2::RIGHT_TOP, "PANIC", egui::FontId::proportional(10.0), Color32::from_rgb(235, 60, 60));
     }
     if let Some(k) = st.key_label(&Action::TriggerSlot { layer, col }) {
-        painter.text(rect.right_top() + vec2(-4.0, 3.0), egui::Align2::RIGHT_TOP, k, egui::FontId::monospace(11.0), Color32::from_rgb(255, 210, 90));
+        key_badge(painter, rect.right_top() + vec2(-4.0, 4.0), &k);
     }
-    // Sequence membership: a numbered bar along the bottom of the slot.
-    if let Some((_, seq)) = st.project.deck().and_then(|d| d.sequence_at(layer, col)) {
-        let n = seq.cols.iter().position(|&c| c == col).unwrap_or(0) + 1;
-        let cyan = Color32::from_rgb(80, 200, 255);
-        let bar = Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 3.0), rect.max);
-        painter.rect_filled(bar, 0.0, cyan);
-        let tag = format!("{n}/{}{}", seq.cols.len(), if seq.loop_all { " ⟲" } else { "" });
-        painter.text(egui::pos2(rect.max.x - 4.0, rect.max.y - 5.0), egui::Align2::RIGHT_BOTTOM, tag, egui::FontId::monospace(10.0), cyan);
+    // Layer chain: a line down the left edge joining its slots, the step number on each.
+    let spans = |ch: &&evj_core::model::LayerChain| ch.col == col && ch.steps[0].layer <= layer && layer <= ch.steps[ch.steps.len() - 1].layer;
+    if let Some((i, ch)) = st.project.deck().and_then(|d| d.layer_chains.iter().enumerate().find(|(_, ch)| spans(ch))) {
+        let color = chain_color(i);
+        let (first, last) = (ch.steps[0].layer == layer, ch.steps[ch.steps.len() - 1].layer == layer);
+        let top = if first { rect.top() + 4.0 } else { rect.top() - ui.spacing().item_spacing.y };
+        let bottom = if last { rect.bottom() - 4.0 } else { rect.bottom() };
+        painter.rect_filled(Rect::from_min_max(egui::pos2(rect.left(), top), egui::pos2(rect.left() + 4.0, bottom)), 0.0, color);
+        if let Some(k) = ch.steps.iter().position(|s| s.layer == layer) {
+            let step = ch.steps[k];
+            let mut tag = format!("{}", k + 1);
+            if k == 0 {
+                tag += if ch.looping { " ⟲" } else { " ■" };
+            } else {
+                if let StepStart::AfterSecs(n) = step.start {
+                    tag += &format!(" +{n:.1}s");
+                }
+                if step.mode == StepMode::Overlay {
+                    tag += " 🗗";
+                }
+            }
+            let galley = painter.layout_no_wrap(tag, egui::FontId::monospace(11.0), color);
+            let at = egui::pos2(img.left() + 7.0, img.center().y - galley.size().y / 2.0);
+            painter.rect_filled(Rect::from_min_size(at - vec2(2.0, 1.0), galley.size() + vec2(4.0, 2.0)), 3.0, Color32::from_black_alpha(190));
+            painter.galley(at, galley, color);
+        }
     }
     let stroke = if st.map_target == Some(Action::TriggerSlot { layer, col }) {
         Stroke::new(2.0, Color32::from_rgb(255, 150, 40))
@@ -1222,8 +1701,7 @@ fn slot(ui: &mut egui::Ui, st: &mut UiState, thumbs: &mut Thumbnailer, layer: us
         if st.map_keys {
             st.click(Action::TriggerSlot { layer, col }, act);
         } else if clip.is_some() && ui.input(|i| i.modifiers.shift) {
-            crate::sequence::toggle_multi(st, layer, col);
-            st.status = format!("{} slot(s) selected — right-click → Make sequence", st.multi.len());
+            crate::chain::toggle_multi(st, layer, col);
         } else if clip.is_some() {
             st.multi.clear();
             st.selected = Selection::Slot(layer, col); // cue on PREVIEW
@@ -1256,39 +1734,34 @@ fn slot(ui: &mut egui::Ui, st: &mut UiState, thumbs: &mut Thumbnailer, layer: us
                 st.dirty = true;
                 ui.close();
             }
-            let picked = st.multi.len() >= 2 && st.multi.contains(&(layer, col));
-            if content && picked && ui.button(format!("Make sequence ({} clips)", st.multi.len())).clicked() {
-                let cols: Vec<usize> = st.multi.iter().map(|(_, c)| *c).collect();
-                if st.project.deck_mut().is_some_and(|d| d.make_sequence(layer, &cols)) {
-                    st.status = "Sequence made — trigger its first clip to play them one after another".into();
-                    st.dirty = true;
-                }
-                st.multi.clear();
-                ui.close();
-            }
-            let seq = st.project.deck().and_then(|d| d.sequence_at(layer, col)).map(|(i, s)| (i, s.clone()));
-            if let Some((i, mut s)) = seq.filter(|_| content) {
-                ui.separator();
-                ui.label(RichText::new("Sequence").strong());
-                let mut changed = ui.checkbox(&mut s.loop_all, "Loop the whole sequence").changed();
-                ui.horizontal(|ui| {
-                    ui.label("Still images");
-                    changed |= ui.add(egui::DragValue::new(&mut s.still_secs).range(1.0..=600.0).suffix(" s")).changed();
-                });
-                if changed {
-                    if let Some(d) = st.project.deck_mut() {
-                        d.sequences[i] = s;
+            // Shift+clicked slots: one scene = a layer chain, several scenes = a scene chain.
+            let picked = st.multi.contains(&(layer, col));
+            let label = match crate::chain::pick(st).filter(|_| picked) {
+                Some(crate::chain::Pick::Layers(_, l)) => Some(format!("Chain layers ({} clips)", l.len())),
+                Some(crate::chain::Pick::Scenes(c)) => Some(format!("Chain scenes ({})", c.len())),
+                None => None,
+            };
+            match label {
+                Some(label) => {
+                    if ui.add_enabled(content, egui::Button::new(label)).clicked() {
+                        crate::chain::apply_pick(st);
+                        ui.close();
                     }
-                    st.dirty = true;
                 }
-                if ui.button("Break sequence").clicked() {
+                None => {
+                    ui.add_enabled(false, egui::Button::new("Chain…"));
+                    ui.label(RichText::new("Shift+click 2 or more slots first: one scene = layer chain, several scenes = scene chain").small().weak());
+                }
+            }
+            let chain = st.project.deck().and_then(|d| d.layer_chain_at(layer, col)).map(|(i, _)| i);
+            if let Some(i) = chain.filter(|_| content) {
+                if ui.button("Break layer chain").clicked() {
                     if let Some(d) = st.project.deck_mut() {
-                        d.break_sequence(i);
+                        d.break_layer_chain(i);
                     }
                     st.dirty = true;
                     ui.close();
                 }
-                ui.separator();
             }
             if content && ui.button("Remove").clicked() {
                 if let Some(d) = st.project.deck_mut() {
@@ -1321,14 +1794,18 @@ pub(crate) fn properties_panel(ui: &mut egui::Ui, st: &mut UiState, snap: &Snaps
     egui::ScrollArea::vertical().id_salt("properties_panel").show(ui, |ui| properties(ui, st, snap, thumbs, act));
 }
 
-fn properties(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, thumbs: &Thumbnailer, act: &mut Actions) {
+fn properties(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, _thumbs: &Thumbnailer, act: &mut Actions) {
     ui.horizontal(|ui| {
         if ui.selectable_label(st.selected == Selection::Composition, "Composition").clicked() {
             st.selected = Selection::Composition;
         }
     });
     match st.selected {
-        Selection::Slot(layer, col) => clip_props(ui, st, thumbs, snap, layer, col, act),
+        Selection::Slot(layer, _) => {
+            ui.label(RichText::new("Clip settings, effects and start / end are in the Preview panel.").small().weak());
+            ui.separator();
+            layer_props(ui, st, snap, layer, act);
+        }
         Selection::Layer(layer) => layer_props(ui, st, snap, layer, act),
         Selection::Scene(c) => {
             ui.heading(st.project.deck().map(|d| d.scene_name(c)).unwrap_or_default());
@@ -1390,6 +1867,16 @@ fn clip_props(ui: &mut egui::Ui, st: &mut UiState, thumbs: &Thumbnailer, snap: &
             ui.checkbox(&mut clip.audio, "play audio (1x speed only)");
             ui.end_row();
         }
+        if evj_media::image::is_image(&clip.path) {
+            ui.label("Image duration");
+            ui.add_enabled_ui(content, |ui| {
+                let mut secs = clip.image_secs();
+                if ui.add(egui::DragValue::new(&mut secs).range(0.1..=3600.0).speed(0.1).suffix(" s")).on_hover_text("How long the image plays (Loop repeats it, Once holds the picture at the end)").changed() {
+                    clip.still_secs = Some(secs);
+                }
+            });
+            ui.end_row();
+        }
         ui.label("Fit");
         egui::ComboBox::from_id_salt("fit").selected_text(format!("{:?}", clip.fit)).show_ui(ui, |ui| {
             for f in [FitMode::Fit, FitMode::Fill, FitMode::Stretch] {
@@ -1403,15 +1890,21 @@ fn clip_props(ui: &mut egui::Ui, st: &mut UiState, thumbs: &Thumbnailer, snap: &
     }
     ui.separator();
     ui.strong("Clip effects");
-    ui.add_enabled_ui(content, |ui| crate::fxui::chain(ui, "clipfx", &mut clip.effects, &snap.effects));
+    let mut fx_out = crate::fxui::ChainOut::default();
+    ui.add_enabled_ui(content, |ui| crate::fxui::chain(ui, "clipfx", &mut clip.effects, &snap.effects, true, &mut fx_out));
     if *clip != before {
         clip.in_point = clip.in_point.min(clip.out_point);
         let c = clip.clone();
         if playing {
-            let clip = crate::sequence::as_played(st, layer, col, c);
+            let clip = crate::chain::as_played(st, layer, col, c);
             act.commands.push(Command::UpdateClip { layer, clip });
         }
         st.dirty = true;
+    }
+    st.fx_rects = fx_out.rects;
+    if let Some(effect) = fx_out.pick {
+        st.eyedrop = Some(Eyedrop { deck: st.project.active_deck, layer, col, effect });
+        st.status = "Eyedropper: click the colour to remove on the Preview or Program monitor (Esc cancels)".into();
     }
 }
 
@@ -1448,21 +1941,13 @@ fn layer_props(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, layer: usiz
     });
     ui.separator();
     ui.strong("Layer effects");
-    ui.add_enabled_ui(content, |ui| crate::fxui::chain(ui, "layerfx", &mut l.effects, &snap.effects));
+    ui.add_enabled_ui(content, |ui| crate::fxui::chain(ui, "layerfx", &mut l.effects, &snap.effects, false, &mut Default::default()));
     if *l != before {
         act.commands.push(Command::SetLayer { layer, props: l.clone() });
         st.dirty = true;
     }
-    if n > 1 && ui.add_enabled(content, egui::Button::new("Delete layer")).clicked() {
-        st.project.remove_layer(layer);
-        st.playing.remove(layer.min(st.playing.len() - 1));
-        st.selected = Selection::None;
-        st.layers_changed(act);
-        // Clips on the layers above moved down one row: restart them where they now are.
-        for i in layer..st.project.composition.layers.len() {
-            act.commands.push(Command::Clear { layer: i, transition: None });
-            st.playing[i] = None;
-        }
+    if n > 1 && ui.add_enabled(content, egui::Button::new("Delete layer…")).clicked() {
+        st.confirm_delete = Some(Delete::Layer(layer));
     }
 }
 
@@ -1495,7 +1980,7 @@ fn composition_props(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, act: 
     ui.separator();
     ui.strong("Composition effects");
     let content = crate::lock::allowed(st.locked, crate::lock::Op::Content);
-    if ui.add_enabled_ui(content, |ui| crate::fxui::chain(ui, "compfx", &mut st.project.composition.effects, &snap.effects)).inner {
+    if ui.add_enabled_ui(content, |ui| crate::fxui::chain(ui, "compfx", &mut st.project.composition.effects, &snap.effects, false, &mut Default::default())).inner {
         act.commands.push(Command::SetCompositionEffects(st.project.composition.effects.clone()));
         st.dirty = true;
     }
@@ -1503,6 +1988,11 @@ fn composition_props(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, act: 
 }
 
 /// Stable per-layer colour (tally strips, opacity bars, countdown rows).
+/// Chain i's colour (indicators on the grid and in the Chain settings).
+pub fn chain_color(i: usize) -> Color32 {
+    [Color32::from_rgb(80, 200, 255), Color32::from_rgb(230, 110, 255), Color32::from_rgb(150, 230, 90), Color32::from_rgb(255, 170, 60)][i % 4]
+}
+
 pub fn layer_color(i: usize) -> Color32 {
     const C: [Color32; 6] = [
         Color32::from_rgb(40, 150, 230),
@@ -1604,5 +2094,511 @@ mod tests {
         assert_eq!(clears, st.project.composition.layers.len());
         assert!(act.commands.iter().any(|c| matches!(c, Command::PanicAudio)));
         assert!(!act.commands.iter().any(|c| matches!(c, Command::Trigger { .. })), "nothing to play");
+    }
+    #[test]
+    fn moving_a_layer_up_moves_the_show_and_the_engine() {
+        let mut st = UiState::new(Project::new_default());
+        st.project.decks[0].slots[1][0] = Some(Clip::new("C:/m/b.mov".into()));
+        st.trigger(1, 0, &mut Actions::default());
+        st.selected = Selection::Slot(1, 0);
+        let mut act = Actions::default();
+        st.move_layer(1, true, &mut act);
+        assert_eq!(st.project.decks[0].clip(0, 0).unwrap().name, "b");
+        assert_eq!(st.playing[0], Some((0, 0)), "the tally moved with it");
+        assert_eq!(st.playing[1], None);
+        assert_eq!(st.selected, Selection::Slot(0, 0), "the selection follows");
+        assert!(act.commands.iter().any(|c| matches!(c, Command::MoveLayer { from: 1, to: 0 })));
+        assert!(!act.commands.iter().any(|c| matches!(c, Command::Trigger { .. } | Command::Clear { .. })), "nothing restarts");
+        let mut act = Actions::default();
+        st.move_layer(0, true, &mut act);
+        assert!(act.commands.is_empty(), "layer 1 is already on top");
+    }
+
+    #[test]
+    fn deleting_a_layer_keeps_the_others_playing() {
+        let mut st = UiState::new(Project::new_default());
+        for l in 0..3 {
+            st.project.decks[0].slots[l][0] = Some(Clip::new(format!("C:/m/{l}.mov").into()));
+            st.trigger(l, 0, &mut Actions::default());
+        }
+        let mut act = Actions::default();
+        st.delete_layer(1, &mut act);
+        assert_eq!(st.project.composition.layers.len(), 3);
+        assert_eq!(st.playing, vec![Some((0, 0)), Some((0, 0)), None]);
+        assert_eq!(st.project.decks[0].clip(1, 0).unwrap().name, "2", "layer 3 moved up");
+        assert!(act.commands.iter().any(|c| matches!(c, Command::Clear { layer: 1, .. })), "the deleted layer goes dark first");
+        let clears = act.commands.iter().filter(|c| matches!(c, Command::Clear { .. })).count();
+        assert_eq!(clears, 1, "nothing else restarts");
+        assert!(act.commands.iter().any(|c| matches!(c, Command::MoveLayer { .. })));
+        assert!(act.commands.iter().any(|c| matches!(c, Command::SetLayerCount(3))));
+    }
+
+    #[test]
+    fn deleting_a_scene_on_air_clears_it_first() {
+        let mut st = UiState::new(Project::new_default());
+        st.project.decks[0].slots[0][1] = Some(Clip::new("C:/m/b.mov".into()));
+        st.project.decks[0].slots[1][3] = Some(Clip::new("C:/m/d.mov".into()));
+        st.trigger(0, 1, &mut Actions::default());
+        st.trigger(1, 3, &mut Actions::default());
+        st.selected = Selection::Scene(3);
+        let cols = st.project.columns();
+        let mut act = Actions::default();
+        st.delete_scene(1, &mut act);
+        assert_eq!(st.project.columns(), cols - 1);
+        assert!(act.commands.iter().any(|c| matches!(c, Command::Clear { layer: 0, .. })));
+        assert_eq!(st.playing[0], None);
+        assert_eq!(st.playing[1], Some((0, 2)), "a scene to the right moved left");
+        assert_eq!(st.selected, Selection::Scene(2));
+    }
+
+    #[test]
+    fn images_show_their_duration_on_the_slot() {
+        let mut c = Clip::new("C:/m/photo.jpg".into());
+        assert_eq!(slot_secs(&c, None), Some(evj_core::model::DEFAULT_IMAGE_SECS));
+        c.still_secs = Some(7.5);
+        assert_eq!(slot_secs(&c, None), Some(7.5));
+        let v = Clip::new("C:/m/clip.mov".into());
+        assert_eq!(slot_secs(&v, None), None, "video: from the file once it is read");
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use crate::waveform::Waveforms;
+
+    fn frame(ctx: &egui::Context, st: &mut UiState, thumbs: &mut Thumbnailer, waves: &mut Waveforms, events: Vec<egui::Event>) -> Actions {
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 900.0))), events, ..Default::default() };
+        let snap = Snapshot { layers: vec![Default::default(); st.project.composition.layers.len()], ..Default::default() };
+        let mut act = Actions::default();
+        let _ = ctx.run_ui(raw, |ui| act.absorb(draw(ui, st, &snap, None, None, None, thumbs, waves, &Vec::new())));
+        act
+    }
+
+    /// Every text drawn in one frame (menus, labels).
+    fn texts(ctx: &egui::Context, st: &mut UiState, thumbs: &mut Thumbnailer, waves: &mut Waveforms, events: Vec<egui::Event>) -> Vec<String> {
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 900.0))), events, ..Default::default() };
+        let snap = Snapshot { layers: vec![Default::default(); st.project.composition.layers.len()], ..Default::default() };
+        let out = ctx.run_ui(raw, |ui| {
+            let _ = draw(ui, st, &snap, None, None, None, thumbs, waves, &Vec::new());
+        });
+        out.shapes.iter().filter_map(|c| if let egui::epaint::Shape::Text(t) = &c.shape { Some(t.galley.text().to_string()) } else { None }).collect()
+    }
+
+    /// A right-click at `p` (move, press, release), then the frame after it.
+    fn right_click(ctx: &egui::Context, st: &mut UiState, thumbs: &mut Thumbnailer, waves: &mut Waveforms, p: egui::Pos2) -> Vec<String> {
+        let press = |pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE };
+        frame(ctx, st, thumbs, waves, vec![egui::Event::PointerMoved(p)]);
+        frame(ctx, st, thumbs, waves, vec![press(true)]);
+        frame(ctx, st, thumbs, waves, vec![press(false)]);
+        texts(ctx, st, thumbs, waves, vec![])
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn enter_answers_a_delete_question_without_a_take() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        st.selected = Selection::Slot(1, 0); // Enter would put it on Program
+        let cols = st.project.columns();
+        st.confirm_delete = Some(Delete::Scene(3));
+        let t = texts(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        assert!(t.iter().any(|x| x == "Delete scene?"), "the question is shown: {:?}", t.iter().filter(|x| x.len() < 40).collect::<Vec<_>>());
+        let act = frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![key(egui::Key::Enter)]);
+        assert_eq!(st.project.columns(), cols - 1, "Enter = Delete");
+        assert!(st.confirm_delete.is_none());
+        assert!(!act.commands.iter().any(|c| matches!(c, Command::Trigger { .. })), "the key went to the dialog, not to TAKE");
+    }
+
+    #[test]
+    fn esc_cancels_a_question() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        let cols = st.project.columns();
+        st.confirm_delete = Some(Delete::Scene(3));
+        frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![key(egui::Key::Escape)]);
+        assert_eq!(st.project.columns(), cols);
+        assert!(st.confirm_delete.is_none());
+    }
+
+    #[test]
+    fn right_click_on_a_scene_header_offers_delete_and_chain() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        for c in 1..3 {
+            st.project.decks[0].slots[0][c] = Some(Clip::new(format!("C:/m/{c}.png").into()));
+        }
+        st.multi_scenes = vec![1, 2];
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        }
+        let p = st.scene_rects.iter().find(|(_, c)| *c == 1).map(|(r, _)| r.center()).unwrap();
+        let t = right_click(&ctx, &mut st, &mut thumbs, &mut waves, p);
+        for want in ["Rename…", "Delete scene…", "Chain scenes (2)"] {
+            assert!(t.iter().any(|x| x == want), "{want} missing; drawn: {:?}", t.iter().filter(|x| x.len() < 30).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn right_click_on_a_layer_name_offers_delete() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        }
+        let p = st.layer_name_rects.iter().find(|(_, l)| *l == 1).map(|(r, _)| r.center()).expect("layer name");
+        let t = right_click(&ctx, &mut st, &mut thumbs, &mut waves, p);
+        assert!(t.iter().any(|x| x == "Delete layer…"), "drawn: {:?}", t.iter().filter(|x| x.len() < 30).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn right_click_anywhere_on_a_layers_controls_opens_its_menu() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        }
+        // Below the name row, left of the opacity bar's end: empty space of the layer's block.
+        let name = st.layer_name_rects.iter().find(|(_, l)| *l == 1).map(|(r, _)| *r).unwrap();
+        let p = egui::pos2(name.left() + 2.0, name.bottom() + 70.0);
+        let t = right_click(&ctx, &mut st, &mut thumbs, &mut waves, p);
+        for want in ["Move up", "Move down", "Delete layer…"] {
+            assert!(t.iter().any(|x| x == want), "{want} missing: {:?}", t.iter().filter(|x| x.len() < 30).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn chain_choices_show_even_before_a_multi_selection() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        }
+        let p = st.slot_rects.iter().find(|(_, l, c)| *l == 1 && *c == 0).map(|(r, _, _)| r.center()).unwrap();
+        let t = right_click(&ctx, &mut st, &mut thumbs, &mut waves, p);
+        assert!(t.iter().any(|x| x == "Chain…"), "{:?}", t.iter().filter(|x| x.len() < 30).collect::<Vec<_>>());
+        assert!(t.iter().any(|x| x.starts_with("Shift+click")), "the menu says how");
+        frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![key(egui::Key::Escape)]);
+        let p = st.scene_rects.iter().find(|(_, c)| *c == 0).map(|(r, _)| r.center()).unwrap();
+        let t = right_click(&ctx, &mut st, &mut thumbs, &mut waves, p);
+        assert!(t.iter().any(|x| x == "Chain scenes…"), "{:?}", t.iter().filter(|x| x.len() < 30).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn enter_renames_a_scene() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        st.rename_scene = Some((2, "Opening".into()));
+        frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![key(egui::Key::Enter)]);
+        assert!(st.rename_scene.is_none());
+        assert_eq!(st.project.decks[0].scene_name(2), "Opening");
+    }
+
+    #[test]
+    fn a_long_clip_name_is_cut_so_loop_and_seek_keep_their_row() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        st.layout = crate::dock::preset_live();
+        st.project.decks[0].clip_mut(1, 0).unwrap().name = "VIDEO PROFIL BPIP RI 2025 - a very long clip name from a real show".into();
+        st.selected = Selection::Slot(1, 0);
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1100.0, 900.0))), ..Default::default() };
+        let snap = Snapshot { layers: vec![Default::default(); 4], ..Default::default() };
+        let mut out = None;
+        for _ in 0..4 {
+            out = Some(ctx.run_ui(raw.clone(), |ui| {
+                let _ = draw(ui, &mut st, &snap, None, None, None, &mut thumbs, &mut waves, &Vec::new());
+            }));
+        }
+        let shapes: Vec<(String, Rect)> = out.unwrap().shapes.iter().filter_map(|c| if let egui::epaint::Shape::Text(t) = &c.shape { Some((t.galley.text().to_string(), t.visual_bounding_rect())) } else { None }).collect();
+        let at = |f: &dyn Fn(&str) -> bool| shapes.iter().find(|(t, _)| f(t)).map(|(_, r)| *r);
+        let looping = at(&|t| t == "⟲ Loop").expect("loop");
+        // The timeline title: the copy of the name nearest above the Loop button (not the Preview header / clip settings).
+        let name = shapes.iter().filter(|(t, r)| t.starts_with("VIDEO PROFIL") && r.top() < looping.top()).max_by(|a, b| a.1.top().total_cmp(&b.1.top())).map(|(t, r)| (t.clone(), *r)).expect("timeline title");
+        let seek = at(&|t| t == "Seek:").expect("seek");
+        let (_, panel) = st.preview_width;
+        assert!(name.1.height() < 24.0 && name.1.width() < panel - 60.0, "one cut line inside the panel: {:?} in {panel}", name.1);
+        assert!((looping.center().y - seek.center().y).abs() < 2.0, "Loop and Seek share a row");
+        assert!(name.1.bottom() <= looping.top(), "the title is above them");
+    }
+
+    /// A Shift+click at `p`, as winit delivers it (Shift held in the frame's modifiers too).
+    fn shift_click(ctx: &egui::Context, st: &mut UiState, thumbs: &mut Thumbnailer, waves: &mut Waveforms, p: egui::Pos2) {
+        let m = egui::Modifiers::SHIFT;
+        let run = |ctx: &egui::Context, st: &mut UiState, thumbs: &mut Thumbnailer, waves: &mut Waveforms, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 900.0))), events, modifiers: m, ..Default::default() };
+            let snap = Snapshot { layers: vec![Default::default(); st.project.composition.layers.len()], ..Default::default() };
+            let _ = ctx.run_ui(raw, |ui| {
+                let _ = draw(ui, st, &snap, None, None, None, thumbs, waves, &Vec::new());
+            });
+        };
+        let press = |pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: m };
+        run(ctx, st, thumbs, waves, vec![egui::Event::PointerMoved(p)]);
+        run(ctx, st, thumbs, waves, vec![press(true)]);
+        run(ctx, st, thumbs, waves, vec![press(false)]);
+        // Time passes between clicks (no double-click).
+        std::thread::sleep(std::time::Duration::from_millis(350));
+    }
+
+    #[test]
+    fn shift_clicking_three_slots_and_three_scenes_offers_both_chains() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        for l in 0..3 {
+            st.project.decks[0].slots[l][1] = Some(Clip::new(format!("C:/m/{l}.png").into()));
+        }
+        for c in 2..4 {
+            st.project.decks[0].slots[0][c] = Some(Clip::new(format!("C:/m/s{c}.png").into()));
+        }
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        }
+        let slot = |st: &UiState, l: usize| st.slot_rects.iter().find(|(_, x, c)| *x == l && *c == 1).map(|(r, _, _)| r.center()).unwrap();
+        for l in 0..3 {
+            let p = slot(&st, l);
+            shift_click(&ctx, &mut st, &mut thumbs, &mut waves, p);
+        }
+        assert_eq!(st.multi, vec![(0, 1), (1, 1), (2, 1)], "three slots of the scene");
+        let p = slot(&st, 2);
+        let t = right_click(&ctx, &mut st, &mut thumbs, &mut waves, p);
+        assert!(t.iter().any(|x| x == "Chain layers (3 clips)"), "{:?}", t.iter().filter(|x| x.len() < 30).collect::<Vec<_>>());
+        frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![key(egui::Key::Escape)]);
+        let head = |st: &UiState, c: usize| st.scene_rects.iter().find(|(_, x)| *x == c).map(|(r, _)| r.center()).unwrap();
+        for c in 1..4 {
+            let p = head(&st, c);
+            shift_click(&ctx, &mut st, &mut thumbs, &mut waves, p);
+        }
+        assert_eq!(st.multi_scenes, vec![1, 2, 3]);
+        let p = head(&st, 3);
+        let t = right_click(&ctx, &mut st, &mut thumbs, &mut waves, p);
+        assert!(t.iter().any(|x| x == "Chain scenes (3)"), "{:?}", t.iter().filter(|x| x.len() < 30).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn slots_of_different_scenes_offer_a_scene_chain() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        st.project.decks[0].slots[1][2] = Some(Clip::new("C:/m/c.png".into()));
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        }
+        let slot = |st: &UiState, c: usize| st.slot_rects.iter().find(|(_, l, x)| *l == 1 && *x == c).map(|(r, _, _)| r.center()).unwrap();
+        for c in [0, 2] {
+            let p = slot(&st, c);
+            shift_click(&ctx, &mut st, &mut thumbs, &mut waves, p);
+        }
+        let p = slot(&st, 2);
+        let t = right_click(&ctx, &mut st, &mut thumbs, &mut waves, p);
+        assert!(t.iter().any(|x| x == "Chain scenes (2)"), "{:?}", t.iter().filter(|x| x.len() < 30).collect::<Vec<_>>());
+    }
+
+    /// The library as the engine reports it, with the built-in Chroma Key.
+    fn fx_snap(st: &UiState) -> Snapshot {
+        let meta = evj_core::effect::parse_meta(include_str!("../../../effects/chroma_key.hlsl")).unwrap();
+        let info = evj_engine::fx::EffectInfo { meta, builtin: true, error: None };
+        Snapshot { layers: vec![Default::default(); st.project.composition.layers.len()], effects: std::sync::Arc::new(vec![info]), ..Default::default() }
+    }
+
+    /// A tall screen: the clip effects sit below the fold of a 900 px Preview panel.
+    fn frame_with(ctx: &egui::Context, st: &mut UiState, thumbs: &mut Thumbnailer, waves: &mut Waveforms, snap: &Snapshot, events: Vec<egui::Event>) -> (Actions, Vec<String>) {
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1800.0))), events, ..Default::default() };
+        let mut act = Actions::default();
+        let out = ctx.run_ui(raw, |ui| act.absorb(draw(ui, st, snap, None, None, None, thumbs, waves, &Vec::new())));
+        let texts = out.shapes.iter().filter_map(|c| if let egui::epaint::Shape::Text(t) = &c.shape { Some(t.galley.text().to_string()) } else { None }).collect();
+        (act, texts)
+    }
+
+    fn click_at(ctx: &egui::Context, st: &mut UiState, thumbs: &mut Thumbnailer, waves: &mut Waveforms, snap: &Snapshot, p: egui::Pos2) -> Actions {
+        let press = |pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        let mut act = frame_with(ctx, st, thumbs, waves, snap, vec![egui::Event::PointerMoved(p)]).0;
+        act.absorb(frame_with(ctx, st, thumbs, waves, snap, vec![press(true)]).0);
+        act.absorb(frame_with(ctx, st, thumbs, waves, snap, vec![press(false)]).0);
+        act
+    }
+
+    #[test]
+    fn the_eyedropper_picks_a_key_colour_from_the_preview() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        st.layout = crate::dock::preset_live();
+        st.project.decks[0].clip_mut(1, 0).unwrap().effects.push(evj_core::effect::EffectRef::new("Chroma Key"));
+        st.selected = Selection::Slot(1, 0);
+        let snap = fx_snap(&st);
+        for _ in 0..3 {
+            frame_with(&ctx, &mut st, &mut thumbs, &mut waves, &snap, vec![]);
+        }
+        // Open the effect, then press Pick.
+        let head = st.fx_rects.iter().find(|(n, _)| n == "Chroma Key").map(|(_, r)| r.center()).expect("effect header");
+        click_at(&ctx, &mut st, &mut thumbs, &mut waves, &snap, head);
+        for _ in 0..2 {
+            frame_with(&ctx, &mut st, &mut thumbs, &mut waves, &snap, vec![]);
+        }
+        let pick = st.fx_rects.iter().find(|(n, _)| n == "Pick").map(|(_, r)| r.center()).unwrap_or_else(|| panic!("Pick button; header at {head:?}, rects {:?}", st.fx_rects));
+        click_at(&ctx, &mut st, &mut thumbs, &mut waves, &snap, pick);
+        assert!(st.eyedrop.is_some(), "armed");
+        // Click the middle of the Preview monitor.
+        let mon = st.monitor_rects[1].expect("preview monitor");
+        let act = click_at(&ctx, &mut st, &mut thumbs, &mut waves, &snap, mon.center());
+        let reply = act.commands.iter().find_map(|c| match c {
+            Command::PickColor { at, pos, reply } => Some((*at, *pos, reply.clone())),
+            _ => None,
+        });
+        let (at, pos, reply) = reply.expect("a PickColor for the engine");
+        assert_eq!(at, evj_engine::PickAt::Preview);
+        assert!((pos[0] - 0.5).abs() < 0.02 && (pos[1] - 0.5).abs() < 0.02, "{pos:?}");
+        assert!(st.eyedrop.is_none(), "one pick per press");
+        reply.send(Some([0.1, 0.8, 0.3])).unwrap();
+        frame_with(&ctx, &mut st, &mut thumbs, &mut waves, &snap, vec![]);
+        let e = &st.project.decks[0].clip(1, 0).unwrap().effects[0];
+        let v = |n: &str| e.params.iter().find(|p| p.name == n).map(|p| p.value).unwrap();
+        assert!((v("key_r") - 0.1).abs() < 1e-6 && (v("key_g") - 0.8).abs() < 1e-6 && (v("key_b") - 0.3).abs() < 1e-6);
+        assert!(st.dirty);
+    }
+
+    #[test]
+    fn right_click_on_chosen_slots_offers_a_layer_chain() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        st.project.decks[0].slots[0][0] = Some(Clip::new("C:/m/b.png".into()));
+        st.multi = vec![(0, 0), (1, 0)];
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        }
+        let p = st.slot_rects.iter().find(|(_, l, c)| *l == 1 && *c == 0).map(|(r, _, _)| r.center()).unwrap();
+        let t = right_click(&ctx, &mut st, &mut thumbs, &mut waves, p);
+        assert!(t.iter().any(|x| x == "Chain layers (2 clips)"), "drawn: {:?}", t.iter().filter(|x| x.len() < 30).collect::<Vec<_>>());
+    }
+
+    fn setup() -> (egui::Context, UiState, Thumbnailer, Waveforms) {
+        let mut st = UiState::new(Project::new_default());
+        st.project.decks[0].slots[1][0] = Some(Clip::new("C:/m/a.png".into()));
+        (egui::Context::default(), st, Thumbnailer::start(), Waveforms::start())
+    }
+
+    #[test]
+    fn scene_headers_line_up_with_their_slots() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        }
+        assert!(!st.scene_rects.is_empty());
+        for (r, c) in &st.scene_rects {
+            let slot = st.slot_rects.iter().find(|(_, l, sc)| *l == 0 && sc == c).map(|(r, _, _)| *r).expect("slot");
+            assert!((r.min.x - slot.min.x).abs() < 1.0, "scene {c}: header x {} vs slot x {}", r.min.x, slot.min.x);
+        }
+    }
+
+    #[test]
+    fn layer_one_is_the_top_row() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        }
+        let y = |l: usize| st.clear_rects.iter().find(|(_, x)| *x == l).map(|(r, _)| r.min.y).unwrap();
+        assert!(y(0) < y(1) && y(1) < y(3), "layer 1 first, the last layer at the bottom");
+        let slot_y = |l: usize| st.slot_rects.iter().find(|(_, x, c)| *x == l && *c == 0).map(|(r, _, _)| r.min.y).unwrap();
+        assert!(slot_y(0) < slot_y(3));
+        let slots_x = st.slot_rects.iter().map(|(r, _, _)| r.min.x).fold(f32::MAX, f32::min);
+        for (r, l) in &st.clear_rects {
+            assert!(r.max.x <= slots_x, "layer {l} controls run into the slots: {} > {slots_x}", r.max.x);
+        }
+    }
+
+    #[test]
+    fn the_clear_button_clears_its_layer() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        }
+        let p = st.clear_rects.iter().find(|(_, l)| *l == 1).map(|(r, _)| r.center()).expect("clear button");
+        let mut act = frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![egui::Event::PointerMoved(p)]);
+        let press = |pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        act.absorb(frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![press(true)]));
+        act.absorb(frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![press(false)]));
+        act.absorb(frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]));
+        assert!(act.commands.iter().any(|c| matches!(c, Command::Clear { layer: 1, .. })), "no Clear for layer 1 ({} commands)", act.commands.len());
+    }
+
+    #[test]
+    fn the_layer_column_stays_while_the_slots_scroll() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        for _ in 0..30 {
+            st.project.add_column();
+        }
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        }
+        let clear_x = st.clear_rects[0].0.min.x;
+        let slot = st.slot_rects.iter().find(|(_, l, c)| *l == 0 && *c == 0).map(|(r, _, _)| *r).unwrap();
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(-600.0, 0.0), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE };
+        frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![egui::Event::PointerMoved(slot.center())]);
+        for _ in 0..5 {
+            frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![wheel.clone()]);
+        }
+        frame(&ctx, &mut st, &mut thumbs, &mut waves, vec![]);
+        let moved = st.slot_rects.iter().find(|(_, l, c)| *l == 0 && *c == 0).map_or(-1e9, |(r, _, _)| r.min.x);
+        assert!(moved < slot.min.x - 100.0, "the slots scrolled: {} → {moved}", slot.min.x);
+        assert!((st.clear_rects[0].0.min.x - clear_x).abs() < 0.5, "the layer column did not move");
+    }
+
+    #[test]
+    fn a_narrow_preview_tab_is_not_wider_than_itself() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        st.layout = crate::dock::preset_live();
+        let video = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../evj-media/tests/fixtures/av_320x240.mp4");
+        let mut clip = Clip::new(video.clone());
+        clip.name = "VIDEO PROFIL BPIP RI 2025 - a long clip name from a real show".into();
+        st.project.decks[0].slots[1][0] = Some(clip);
+        st.selected = Selection::Slot(1, 0);
+        for _ in 0..300 {
+            thumbs.poll(&ctx);
+            if thumbs.info(&video).is_some() {
+                break;
+            }
+            thumbs.get(&video);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(thumbs.info(&video).is_some(), "media info read");
+        let raw = |w: f32| egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(w, 900.0))), ..Default::default() };
+        let snap = Snapshot { layers: vec![Default::default(); 4], ..Default::default() };
+        for w in [1100.0, 800.0] {
+            for _ in 0..4 {
+                let _ = ctx.run_ui(raw(w), |ui| {
+                    let _ = draw(ui, &mut st, &snap, None, None, None, &mut thumbs, &mut waves, &Vec::new());
+                });
+            }
+            let (used, avail) = st.preview_width;
+            assert!(avail > 50.0, "the Preview panel was drawn ({avail})");
+            assert!(used <= avail + 1.0, "window {w}: Preview content {used} px wide in a {avail} px tab");
+        }
+    }
+
+    #[test]
+    fn chain_settings_fit_a_narrow_preview_tab() {
+        let (ctx, mut st, mut thumbs, mut waves) = setup();
+        st.layout = crate::dock::preset_live();
+        for l in 0..3 {
+            st.project.decks[0].slots[l][1] = Some(Clip::new(format!("C:/m/{l}.png").into()));
+        }
+        st.project.decks[0].slots[0][2] = Some(Clip::new("C:/m/x.png".into()));
+        st.project.decks[0].make_layer_chain(1, &[0, 1, 2]);
+        st.project.decks[0].layer_chains[0].steps[1] = evj_core::model::ChainStep { layer: 1, start: StepStart::AfterSecs(10.0), mode: StepMode::Overlay };
+        st.project.decks[0].make_scene_chain(&[1, 2]);
+        st.selected = Selection::Slot(1, 1);
+        let raw = |w: f32| egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(w, 900.0))), ..Default::default() };
+        let snap = Snapshot { layers: vec![Default::default(); 4], ..Default::default() };
+        for w in [1100.0, 800.0] {
+            for _ in 0..4 {
+                let _ = ctx.run_ui(raw(w), |ui| {
+                    let _ = draw(ui, &mut st, &snap, None, None, None, &mut thumbs, &mut waves, &Vec::new());
+                });
+            }
+            let (used, avail) = st.preview_width;
+            assert!(avail > 50.0, "the Preview panel was drawn ({avail})");
+            assert!(used <= avail + 1.0, "window {w}: Preview content {used} px wide in a {avail} px tab");
+        }
+    }
+
+    #[test]
+    fn the_symbols_the_ui_draws_exist_in_its_fonts() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        // has_glyph answers for the fonts loaded so far: a yes is sure, a no is not (✔ says no
+        // and draws fine) — so only the symbols this UI added, each one checked yes.
+        for c in ['⏶', '⏷', '🗗', '⟲', '■', '›'] {
+            assert!(ctx.fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(12.0), c)), "{c} would show as an empty box");
+        }
     }
 }

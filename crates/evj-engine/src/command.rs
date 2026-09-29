@@ -13,11 +13,20 @@ pub struct Pointer {
 }
 
 /// Messages from the UI (or tests) to the engine thread. Processed in order, between frames.
+/// Where the eyedropper clicked: a layer's clip on Program, or the Preview (cued clip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickAt {
+    Program(usize),
+    Preview,
+}
+
 pub enum Command {
     /// Opens `clip` in the background; the layer keeps showing its current clip until the new one has a frame.
     Trigger { layer: usize, clip: Clip, transition: Option<evj_core::transition::TransitionPreset> },
     /// Changes playback settings of the clip playing on `layer` (same file).
     UpdateClip { layer: usize, clip: Clip },
+    /// Swaps two layers with what plays on them (nothing is re-opened).
+    MoveLayer { from: usize, to: usize },
     /// Empties the layer; with a transition the current clip fades out.
     Clear { layer: usize, transition: Option<evj_core::transition::TransitionPreset> },
     /// Presentations (a `deck.json` triggered on the layer): next click / previous / jump to a slide.
@@ -53,19 +62,22 @@ pub enum Command {
     /// Renders `config` offscreen and replies with RGBA8 pixels (UI preview, tests).
     RenderOutputPreview { config: evj_core::output::OutputConfig, width: u32, height: u32, reply: Sender<Vec<u8>> },
     /// Replies with a shared-texture handle (keyed mutex, key 0) holding a half-size composition preview.
-    SharePreview(Sender<anyhow::Result<(isize, u32, u32)>>),
+    SharePreview(Sender<anyhow::Result<crate::SharedPreview>>),
     /// Replies with a small shared texture (keyed mutex, key 0) that loops the selected transition.
-    ShareTransitionPreview(Sender<anyhow::Result<(isize, u32, u32)>>),
+    ShareTransitionPreview(Sender<anyhow::Result<crate::SharedPreview>>),
     /// Transition shown in that preview (None = stop rendering it).
     PreviewTransition(Option<String>),
     /// Creates the operator's Preview monitor texture (cued clip); replies (handle, width, height).
-    ShareCuePreview(Sender<anyhow::Result<(isize, u32, u32)>>),
+    ShareCuePreview(Sender<anyhow::Result<crate::SharedPreview>>),
     /// Shows `clip` (with its effects) on the Preview monitor only — never on the outputs, never heard.
     CueClip(Option<Clip>),
     /// The Preview monitor shows a whole scene: one clip per layer (index = layer).
     CueScene(Vec<Option<Clip>>),
     /// Pixels of the Preview monitor (RGBA, empty when there is none) — tests.
     ReadbackCue(Sender<Vec<u8>>),
+    /// Eyedropper: the colour of a clip's own picture (before its effects) where a monitor was
+    /// clicked (`pos` 0..1 of the monitor picture); None when the click is beside the clip.
+    PickColor { at: PickAt, pos: [f32; 2], reply: Sender<Option<[f32; 3]>> },
     /// Pause / resume the cued clip on the Preview monitor.
     CuePause(bool),
     /// Cued clip back to its start (in point), paused.

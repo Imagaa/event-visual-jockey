@@ -40,6 +40,13 @@ pub fn display_adapters() -> Vec<(String, String)> {
 }
 
 impl Gpu {
+    /// GPU scheduling priority of this device (-7..=7; 0 = normal). A negative value never needs
+    /// extra rights: the UI device uses it so the show's own rendering goes first.
+    pub fn set_priority(&self, priority: i32) -> Result<()> {
+        unsafe { self.device.cast::<IDXGIDevice>()?.SetGPUThreadPriority(priority)? };
+        Ok(())
+    }
+
     pub fn new(kind: DeviceKind) -> Result<Gpu> {
         let (mut device, mut ctx) = (None, None);
         let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;

@@ -76,7 +76,7 @@ pub struct Clip {
     pub audio: bool,
     /// Extra audio file played with the picture.
     pub attached: Option<AttachedAudio>,
-    /// A still image ends after this many seconds (sequences); None = stays up.
+    /// How long an image plays (seconds); None = [`DEFAULT_IMAGE_SECS`].
     pub still_secs: Option<f64>,
     /// Has been on PROGRAM (a mark on the slot).
     pub aired: bool,
@@ -98,7 +98,8 @@ impl Default for AttachedAudio {
     }
 }
 
-/// Slots of one layer that play one after another (column order).
+/// Slots of one layer that play one after another (column order). Old shows only:
+/// [`Project::migrate`] turns them into scene chains.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Sequence {
@@ -116,6 +117,53 @@ impl Default for Sequence {
     }
 }
 
+/// When a layer-chain step starts (the first step starts the chain).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum StepStart {
+    /// N seconds after the previous step started.
+    AfterSecs(f64),
+    /// When the previous step's clip ends.
+    #[default]
+    AfterPrevious,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StepMode {
+    /// The previous step's layer is cleared.
+    #[default]
+    Replace,
+    /// The previous step's layer keeps playing underneath / above.
+    Overlay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ChainStep {
+    pub layer: usize,
+    pub start: StepStart,
+    pub mode: StepMode,
+}
+
+/// Slots of several layers in one scene that start one after another (layer order).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LayerChain {
+    pub col: usize,
+    pub steps: Vec<ChainStep>,
+    /// After the last step: clear the chain's layers and start again (else stop).
+    pub looping: bool,
+}
+
+/// Scenes that play one after another (column order).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SceneChain {
+    pub cols: Vec<usize>,
+    pub looping: bool,
+}
+
+pub const DEFAULT_IMAGE_SECS: f64 = 5.0;
+
 impl Default for Clip {
     fn default() -> Self {
         Clip::new(PathBuf::new())
@@ -126,6 +174,11 @@ impl Clip {
     pub fn new(path: PathBuf) -> Clip {
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         Clip { path, name, mode: PlayMode::Loop, speed: 1.0, in_point: 0.0, out_point: 1.0, bpm_beats: None, fit: FitMode::Fit, effects: Vec::new(), transition: None, audio: true, attached: None, still_secs: None, aired: false }
+    }
+
+    /// How long this clip plays when it is an image.
+    pub fn image_secs(&self) -> f64 {
+        self.still_secs.unwrap_or(DEFAULT_IMAGE_SECS)
     }
 }
 
@@ -158,6 +211,8 @@ pub struct Deck {
     /// `slots[layer][column]`.
     pub slots: Vec<Vec<Option<Clip>>>,
     pub sequences: Vec<Sequence>,
+    pub layer_chains: Vec<LayerChain>,
+    pub scene_chains: Vec<SceneChain>,
     /// Column (scene) names; empty = "Scene N".
     pub scene_names: Vec<String>,
 }
@@ -204,15 +259,85 @@ pub struct Project {
     pub presentation_layer: Option<usize>,
     /// Slot played full-frame by PANIC: (deck, layer, column). None = deck 1, layer 1, column 1.
     pub panic_media: Option<(usize, usize, usize)>,
+    /// 0 = old shows (the last layer drawn on top); 1 = Layer 1 on top. See [`Project::migrate`].
+    pub layer_order: u8,
 }
 
 pub const DEFAULT_LAYERS: usize = 4;
 pub const DEFAULT_COLUMNS: usize = 8;
 
 impl Project {
+    /// Defaults to Layer 1 (the top layer).
     pub fn presentation_layer(&self) -> usize {
-        let top = self.composition.layers.len().saturating_sub(1);
-        self.presentation_layer.map_or(top, |l| l.min(top))
+        let last = self.composition.layers.len().saturating_sub(1);
+        self.presentation_layer.map_or(0, |l| l.min(last))
+    }
+
+    /// Brings an old show up to date: sequences become scene chains, and the layers are
+    /// reversed so Layer 1 is the top one (the show looks the same). true when something changed.
+    pub fn migrate(&mut self) -> bool {
+        let mut changed = false;
+        for d in &mut self.decks {
+            d.prune_chains(); // a hand-edited / damaged file must not break the grid
+            for s in std::mem::take(&mut d.sequences) {
+                changed = true;
+                // The sequence's still time becomes its images' own duration (ignored for video).
+                for &c in &s.cols {
+                    if let Some(clip) = d.clip_mut(s.layer, c) {
+                        clip.still_secs.get_or_insert(s.still_secs);
+                    }
+                }
+                if d.make_scene_chain(&s.cols) {
+                    d.scene_chains.last_mut().unwrap().looping = s.loop_all;
+                }
+            }
+        }
+        if self.layer_order == 0 {
+            let n = self.composition.layers.len();
+            let cols = self.columns();
+            self.remap_layers(|l| n - 1 - l);
+            self.composition.layers.reverse();
+            for d in &mut self.decks {
+                d.ensure_size(n, cols);
+                d.slots.reverse();
+            }
+            for (i, layer) in self.composition.layers.iter_mut().enumerate() {
+                if layer.name == format!("Layer {}", n - i) {
+                    layer.name = format!("Layer {}", i + 1);
+                }
+            }
+            self.layer_order = 1;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Points everything that names a layer (chains, keys, PANIC media, presentations) at `f(layer)`.
+    /// Slots and layer settings are moved by the caller.
+    pub(crate) fn remap_layers(&mut self, f: impl Fn(usize) -> usize) {
+        use crate::keymap::Action;
+        let n = self.composition.layers.len();
+        let f = |l: usize| (l < n).then(|| f(l));
+        for d in &mut self.decks {
+            for ch in &mut d.layer_chains {
+                for s in &mut ch.steps {
+                    s.layer = f(s.layer).unwrap_or(s.layer);
+                }
+                ch.steps.sort_by_key(|s| s.layer);
+            }
+        }
+        self.keymap.remap(|a| match *a {
+            Action::TriggerSlot { layer, col } => f(layer).map(|layer| Action::TriggerSlot { layer, col }),
+            Action::ClearLayer(l) => f(l).map(Action::ClearLayer),
+            ref a => Some(a.clone()),
+        });
+        self.panic_media = self.panic_media.and_then(|(d, l, c)| f(l).map(|l| (d, l, c)));
+        for o in &mut self.outputs {
+            if let crate::output::OutputSource::Layer(l) = &mut o.source {
+                *l = f(*l).unwrap_or(*l);
+            }
+        }
+        self.presentation_layer = self.presentation_layer.map(|l| f(l.min(n.saturating_sub(1))).unwrap_or(0));
     }
 
     /// Old shows: the materi list becomes presentation clips in the grid (first empty columns
@@ -244,6 +369,6 @@ impl Project {
     pub fn new_default() -> Project {
         let layers = (0..DEFAULT_LAYERS).map(|i| Layer { name: format!("Layer {}", i + 1), ..Layer::default() }).collect();
         let deck = Deck { name: "Deck 1".into(), slots: vec![vec![None; DEFAULT_COLUMNS]; DEFAULT_LAYERS], ..Default::default() };
-        Project { composition: Composition { layers, ..Composition::default() }, decks: vec![deck], active_deck: 0, keymap: Default::default(), transitions: crate::transition::TransitionPreset::defaults(), outputs: vec![Default::default()], materi: Vec::new(), presentation_layer: None, panic_media: None }
+        Project { composition: Composition { layers, ..Composition::default() }, decks: vec![deck], active_deck: 0, keymap: Default::default(), transitions: crate::transition::TransitionPreset::defaults(), outputs: vec![Default::default()], materi: Vec::new(), presentation_layer: None, panic_media: None, layer_order: 1 }
     }
 }

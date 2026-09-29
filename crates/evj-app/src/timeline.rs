@@ -67,7 +67,7 @@ pub fn mark(st: &mut UiState, snap: &Snapshot, start: bool, act: &mut Actions) {
 /// A clip setting changed: the show is dirty, the Preview / a playing clip follow it.
 fn edited(st: &mut UiState, layer: usize, col: usize, clip: Clip, playing: bool, act: &mut Actions) {
     if playing {
-        let clip = crate::sequence::as_played(st, layer, col, clip);
+        let clip = crate::chain::as_played(st, layer, col, clip);
         act.commands.push(Command::UpdateClip { layer, clip });
     }
     st.dirty = true;
@@ -111,19 +111,23 @@ fn clip_timeline(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, waves: &m
     let content = crate::lock::allowed(st.locked, crate::lock::Op::Content);
     let playing = st.is_playing(l, c);
     let info = thumbs.info(&clip.path).cloned();
-    // Clip length: what the Preview reports (stills timed by their audio), else the file's.
+    // Clip length: what the Preview reports (images timed by their audio), else the image's / file's.
     let cue = snap.cue_state.as_ref().filter(|q| q.name == clip.name);
-    let duration = cue.map(|q| q.duration).filter(|d| *d > 0.0).or(info.as_ref().map(|i| i.duration)).unwrap_or(0.0);
+    let duration = cue.map(|q| q.duration).filter(|d| *d > 0.0).or_else(|| crate::ui::slot_secs(&clip, info.as_ref())).unwrap_or(0.0);
     let file_len = info.as_ref().map_or(0.0, |i| i.duration);
     if !playing {
         st.seek_program = false;
     }
+    // Title row: a long name is cut with …, so Loop and Seek always sit on the row above the bar.
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(vec2(4.0, 18.0), Sense::hover());
         ui.painter().rect_filled(r, 1.0, layer_color(l));
-        ui.strong(&clip.name);
-        ui.label(RichText::new(crate::transport::clock(duration)).monospace());
-        ui.separator();
+        let length = RichText::new(crate::transport::clock(duration)).monospace();
+        let room = (ui.available_width() - 64.0).max(40.0); // the length label keeps its place
+        ui.allocate_ui(vec2(room, 18.0), |ui| ui.add(egui::Label::new(RichText::new(&clip.name).strong()).truncate()).on_hover_text(&clip.name));
+        ui.label(length);
+    });
+    ui.horizontal_wrapped(|ui| {
         ui.add_enabled_ui(content, |ui| {
             let mut looping = clip.mode == PlayMode::Loop;
             if ui.toggle_value(&mut looping, "⟲ Loop").on_hover_text("Loop between start and end").changed() {
@@ -223,41 +227,44 @@ fn clip_timeline(ui: &mut egui::Ui, st: &mut UiState, snap: &Snapshot, waves: &m
             ui.painter().text(lane.center(), egui::Align2::CENTER_CENTER, "reading sound…", egui::FontId::proportional(10.0), Color32::from_gray(120));
         }
     }
-    ui.horizontal(|ui| {
-        ui.add_enabled_ui(content && markers, |ui| {
-            let cue_pos = snap.cue_state.as_ref().filter(|q| q.name == clip.name).map(|q| q.pos);
-            let key = |x: crate::shortcuts::AppAction| st.shortcuts.combo(x).map(|k| format!(" ({k})")).unwrap_or_default();
-            if ui.button(format!("[ Set start{}", key(crate::shortcuts::AppAction::MarkIn))).on_hover_text("At the Preview playhead").clicked() {
-                if let Some(t) = cue_pos {
-                    set_in(&mut clip, t, file_len);
-                }
+    // Every button sits in the wrapping row on its own, so a narrow panel breaks the row
+    // instead of growing sideways.
+    let cue_pos = snap.cue_state.as_ref().filter(|q| q.name == clip.name).map(|q| q.pos);
+    let key = |x: crate::shortcuts::AppAction| st.shortcuts.combo(x).map(|k| format!(" ({k})")).unwrap_or_default();
+    let (start_key, end_key) = (key(crate::shortcuts::AppAction::MarkIn), key(crate::shortcuts::AppAction::MarkOut));
+    ui.horizontal_wrapped(|ui| {
+        let marks = content && markers;
+        if ui.add_enabled(marks, egui::Button::new(format!("[ Set start{start_key}"))).on_hover_text("At the Preview playhead").clicked() {
+            if let Some(t) = cue_pos {
+                set_in(&mut clip, t, file_len);
             }
-            if ui.button(format!("Set end ]{}", key(crate::shortcuts::AppAction::MarkOut))).clicked() {
-                if let Some(t) = cue_pos {
-                    set_out(&mut clip, t, file_len);
-                }
+        }
+        if ui.add_enabled(marks, egui::Button::new(format!("Set end ]{end_key}"))).clicked() {
+            if let Some(t) = cue_pos {
+                set_out(&mut clip, t, file_len);
             }
-            if ui.button("Reset").on_hover_text("Whole clip").clicked() {
-                (clip.in_point, clip.out_point) = (0.0, 1.0);
-            }
-        });
-        ui.separator();
-        ui.add_enabled_ui(content, |ui| match clip.attached.clone() {
+        }
+        if ui.add_enabled(marks, egui::Button::new("Reset")).on_hover_text("Whole clip").clicked() {
+            (clip.in_point, clip.out_point) = (0.0, 1.0);
+        }
+        match clip.attached.clone() {
             None => {
-                if ui.button("♪ Attach audio…").on_hover_text("Play an audio file with this picture").clicked() {
+                if ui.add_enabled(content, egui::Button::new("♪ Attach audio…")).on_hover_text("Play an audio file with this picture").clicked() {
                     act.menu = Some(Menu::AttachAudio(l, c));
                 }
             }
             Some(mut at) => {
                 let name = at.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 ui.label(RichText::new(format!("♪ {name}")).color(Color32::from_rgb(120, 170, 255)));
-                ui.selectable_value(&mut at.mix, false, "Replace").on_hover_text("Mute the clip's own sound");
-                ui.selectable_value(&mut at.mix, true, "Mix").on_hover_text("Play both");
-                crate::widgets::volume_fader(ui, &mut at.volume);
-                let remove = ui.small_button("✖").on_hover_text("Remove the attached audio").clicked();
+                ui.add_enabled_ui(content, |ui| {
+                    ui.selectable_value(&mut at.mix, false, "Replace").on_hover_text("Mute the clip's own sound");
+                    ui.selectable_value(&mut at.mix, true, "Mix").on_hover_text("Play both");
+                });
+                ui.add_enabled_ui(content, |ui| crate::widgets::volume_fader(ui, &mut at.volume));
+                let remove = ui.add_enabled(content, egui::Button::new("✖").small()).on_hover_text("Remove the attached audio").clicked();
                 clip.attached = if remove { None } else { Some(at) };
             }
-        });
+        }
     });
     if clip != before {
         let audio_changed = clip.attached != before.attached;

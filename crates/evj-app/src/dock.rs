@@ -14,7 +14,6 @@ pub enum Panel {
     Grid,
     Program,
     Preview,
-    Timeline,
     Properties,
     Outputs,
     Transitions,
@@ -23,11 +22,10 @@ pub enum Panel {
 }
 
 impl Panel {
-    pub const ALL: [Panel; 9] = [
+    pub const ALL: [Panel; 8] = [
         Panel::Grid,
         Panel::Program,
         Panel::Preview,
-        Panel::Timeline,
         Panel::Properties,
         Panel::Outputs,
         Panel::Transitions,
@@ -44,7 +42,6 @@ impl Panel {
             Panel::Grid => "Grid",
             Panel::Program => "Program",
             Panel::Preview => "Preview",
-            Panel::Timeline => "Timeline",
             Panel::Properties => "Properties",
             Panel::Outputs => "Outputs",
             Panel::Transitions => "Transitions",
@@ -54,14 +51,14 @@ impl Panel {
     }
 }
 
-/// The show layout: Grid over Timeline on the left; Program, Preview, Properties on the right.
+/// The show layout: Grid on the left; Program above, Preview (clip timeline) / Properties tabs below.
 pub fn preset_live() -> Layout {
     let mut l = DockState::new(vec![Panel::Grid]);
     let tree = l.main_surface_mut();
-    let [left, right] = tree.split_right(NodeIndex::root(), 0.70, vec![Panel::Program]);
-    tree.split_below(left, 0.75, vec![Panel::Timeline]);
-    let [_, below] = tree.split_below(right, 0.34, vec![Panel::Preview]);
-    tree.split_below(below, 0.5, vec![Panel::Properties]);
+    // Program keeps room for its monitor and every layer on air; Preview (clip timeline and
+    // settings) and Properties share the space below as tabs.
+    let [_, right] = tree.split_right(NodeIndex::root(), 0.62, vec![Panel::Program]);
+    tree.split_below(right, 0.5, vec![Panel::Preview, Panel::Properties]);
     l
 }
 
@@ -69,9 +66,9 @@ pub fn preset_live() -> Layout {
 pub fn preset_setup() -> Layout {
     let mut l = DockState::new(vec![Panel::Grid]);
     let tree = l.main_surface_mut();
-    let [left, right] = tree.split_right(NodeIndex::root(), 0.62, vec![Panel::Program, Panel::Preview]);
-    tree.split_below(left, 0.72, vec![Panel::Timeline]);
-    tree.split_below(right, 0.4, vec![Panel::Properties, Panel::Outputs, Panel::Transitions]);
+    let [_, right] = tree.split_right(NodeIndex::root(), 0.62, vec![Panel::Program]);
+    let [_, below] = tree.split_below(right, 0.3, vec![Panel::Preview]);
+    tree.split_below(below, 0.6, vec![Panel::Properties, Panel::Outputs, Panel::Transitions]);
     l
 }
 
@@ -158,6 +155,11 @@ pub struct SaveGate {
 }
 
 impl SaveGate {
+    /// A save could happen now (2 s since the last one) — only then serialize the layout.
+    pub fn rested(&self, now: f64) -> bool {
+        self.at.is_none_or(|t| now - t >= 2.0)
+    }
+
     pub fn due(&mut self, now_json: &serde_json::Value, now: f64) -> bool {
         let changed = self.last.as_ref() != Some(now_json);
         let rested = self.at.is_none_or(|t| now - t >= 2.0);
@@ -207,8 +209,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
         match t {
             Panel::Grid => crate::ui::grid(ui, st, snap, self.thumbs, act),
             Panel::Program => crate::ui::program_panel(ui, st, snap, self.tex.program, act),
-            Panel::Preview => crate::ui::preview_panel(ui, st, snap, self.tex.cue, act),
-            Panel::Timeline => crate::timeline::panel(ui, st, snap, self.waves, self.thumbs, act),
+            Panel::Preview => crate::ui::preview_panel(ui, st, snap, self.tex.cue, self.thumbs, self.waves, act),
             Panel::Properties => crate::ui::properties_panel(ui, st, snap, self.thumbs, act),
             Panel::Outputs => crate::outui::manager_body(ui, st, act, self.previews),
             Panel::Transitions => crate::trui::manager_body(ui, st, snap, act, self.tex.transition),
@@ -223,6 +224,12 @@ impl egui_dock::TabViewer for Viewer<'_> {
 
     fn closeable(&mut self, _t: &mut Panel) -> bool {
         closeable(self.st.locked)
+    }
+
+    /// Panels never scroll sideways: their content follows the tab width (the Grid scrolls its
+    /// slots itself).
+    fn scroll_bars(&self, t: &Panel) -> [bool; 2] {
+        [false, *t != Panel::Grid]
     }
 
     fn allowed_in_windows(&self, _t: &mut Panel) -> bool {
@@ -257,13 +264,13 @@ mod tests {
     #[test]
     fn live_preset_shows_the_show_panels() {
         use Panel::*;
-        assert_eq!(open_set(&preset_live()), vec![Grid, Program, Preview, Timeline, Properties]);
+        assert_eq!(open_set(&preset_live()), vec![Grid, Program, Preview, Properties]);
     }
 
     #[test]
     fn setup_preset_adds_the_managers() {
         let l = preset_setup();
-        for p in [Panel::Grid, Panel::Properties, Panel::Outputs, Panel::Transitions, Panel::Program, Panel::Preview, Panel::Timeline] {
+        for p in [Panel::Grid, Panel::Properties, Panel::Outputs, Panel::Transitions, Panel::Program, Panel::Preview] {
             assert!(is_open(&l, p), "{p:?}");
         }
     }
@@ -271,10 +278,10 @@ mod tests {
     #[test]
     fn toggle_closes_and_reopens_and_open_is_idempotent() {
         let mut l = preset_live();
-        toggle(&mut l, Panel::Timeline);
-        assert!(!is_open(&l, Panel::Timeline));
-        toggle(&mut l, Panel::Timeline);
-        assert!(is_open(&l, Panel::Timeline));
+        toggle(&mut l, Panel::Properties);
+        assert!(!is_open(&l, Panel::Properties));
+        toggle(&mut l, Panel::Properties);
+        assert!(is_open(&l, Panel::Properties));
         open(&mut l, Panel::Outputs);
         open(&mut l, Panel::Outputs);
         assert_eq!(l.iter_all_tabs().filter(|(_, t)| **t == Panel::Outputs).count(), 1);
@@ -301,7 +308,7 @@ mod tests {
     #[test]
     fn garbage_or_unknown_layouts_fall_back_to_live() {
         assert_eq!(open_set(&from_json(&serde_json::json!("nonsense"))), open_set(&preset_live()));
-        let text = to_json(&preset_live()).to_string().replace("\"Timeline\"", "\"NoSuchPanel\"");
+        let text = to_json(&preset_live()).to_string().replace("\"Properties\"", "\"Timeline\"");
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(open_set(&from_json(&v)), open_set(&preset_live()));
     }

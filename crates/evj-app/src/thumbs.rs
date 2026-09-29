@@ -34,9 +34,21 @@ impl Thumbnailer {
             let _ = mf_init_thread();
             let Ok(gpu) = Gpu::new(DeviceKind::Warp) else { return };
             let Ok(blitter) = Blitter::new(&gpu) else { return };
+            // Decoding a frame of every video (software, big 4K files) keeps several cores busy
+            // for seconds: done once per file, then read from disk.
+            let cache = evj_core::io::app_dir().map(|d| d.join("thumbs"));
             for path in jobs {
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| make(&gpu, &blitter, &path)))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("thumbnail crashed")));
+                let r = match cache.as_deref().and_then(|c| cache_load(c, &path)) {
+                    Some(hit) => Ok(hit),
+                    None => {
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| make(&gpu, &blitter, &path)))
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("thumbnail crashed")));
+                        if let (Some(c), Ok((info, px))) = (cache.as_deref(), &r) {
+                            cache_save(c, &path, info, px);
+                        }
+                        r
+                    }
+                };
                 if done.send((path, r)).is_err() {
                     break;
                 }
@@ -76,6 +88,64 @@ impl Thumbnailer {
     }
 }
 
+/// The cache file for `path` as it is now (a changed or moved file gets a new one).
+fn cache_file(dir: &Path, path: &Path) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (path.to_string_lossy().to_lowercase(), meta.len(), mtime).hash(&mut h);
+    Some(dir.join(format!("{:016x}.thumb", h.finish())))
+}
+
+const CACHE_MAGIC: &str = "EVJT1";
+
+fn cache_save(dir: &Path, path: &Path, info: &ClipInfo, rgba: &[u8]) {
+    let Some(file) = cache_file(dir, path) else { return };
+    let frames = info.frame_count.map_or("-".to_string(), |n| n.to_string());
+    let head = format!(
+        "{CACHE_MAGIC} {:?} {} {} {} {frames} {} {} {} {}\n",
+        info.kind, info.width, info.height, info.fps, info.bt709, info.duration, info.random_access, info.has_audio
+    );
+    let _ = std::fs::create_dir_all(dir);
+    let _ = evj_core::io::write_atomic(&file, &[head.as_bytes(), rgba].concat());
+}
+
+fn cache_load(dir: &Path, path: &Path) -> Option<(ClipInfo, Vec<u8>)> {
+    let bytes = std::fs::read(cache_file(dir, path)?).ok()?;
+    let nl = bytes.iter().position(|b| *b == b'\n')?;
+    let head = std::str::from_utf8(&bytes[..nl]).ok()?;
+    let f: Vec<&str> = head.split(' ').collect();
+    let [magic, kind, w, h, fps, frames, bt709, duration, random_access, has_audio] = f[..] else { return None };
+    if magic != CACHE_MAGIC {
+        return None;
+    }
+    let kind = match kind {
+        "Hap" => DecoderKind::Hap,
+        "Image" => DecoderKind::Image,
+        "MediaFoundation" => DecoderKind::MediaFoundation,
+        "Ffmpeg" => DecoderKind::Ffmpeg,
+        "Audio" => DecoderKind::Audio,
+        _ => return None,
+    };
+    let rgba = bytes[nl + 1..].to_vec();
+    if rgba.len() != (W * H * 4) as usize {
+        return None;
+    }
+    let info = ClipInfo {
+        kind,
+        width: w.parse().ok()?,
+        height: h.parse().ok()?,
+        fps: fps.parse().ok()?,
+        frame_count: if frames == "-" { None } else { Some(frames.parse().ok()?) },
+        bt709: bt709.parse().ok()?,
+        duration: duration.parse().ok()?,
+        random_access: random_access.parse().ok()?,
+        has_audio: has_audio.parse().ok()?,
+    };
+    Some((info, rgba))
+}
+
 fn render(gpu: &Gpu, blitter: &Blitter, tex: &Texture, shade: Shade) -> Result<Vec<u8>> {
     let rt = RenderTarget::new(gpu, W, H)?;
     unsafe { gpu.ctx.ClearRenderTargetView(&rt.rtv, &[0.0, 0.0, 0.0, 1.0]) };
@@ -84,6 +154,12 @@ fn render(gpu: &Gpu, blitter: &Blitter, tex: &Texture, shade: Shade) -> Result<V
 }
 
 fn make(gpu: &Gpu, blitter: &Blitter, path: &Path) -> Result<(ClipInfo, Vec<u8>)> {
+    // A presentation (deck.json): its first slide.
+    if evj_core::slides::SlideDeck::is_deck(path) {
+        let deck = evj_core::slides::SlideDeck::load(path)?;
+        let first = deck.slides.first().context("the presentation has no slides")?;
+        return make(gpu, blitter, &first.image);
+    }
     if is_image(path) {
         let (w, h, px) = load_image(path, 1024)?;
         let tex = Texture::new_color(gpu, DXGI_FORMAT_B8G8R8A8_UNORM, w, h)?;
@@ -221,5 +297,52 @@ mod tests {
         assert_eq!(info.kind, DecoderKind::Ffmpeg);
         assert_eq!((info.width, info.height), (320, 240));
         assert!(px.chunks(4).any(|p| p[..3] != [0, 0, 0]), "a picture, not black");
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn a_presentation_shows_its_first_slide() {
+        let dir = std::env::temp_dir().join(format!("evj-deckthumb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../evj-media/tests/fixtures");
+        std::fs::copy(fixtures.join("red_64x36.png"), dir.join("slide001.png")).unwrap();
+        std::fs::copy(fixtures.join("blue_36x64.jpg"), dir.join("slide002.jpg")).unwrap();
+        let slide = |image: &str| evj_core::slides::Slide { image: image.into(), video: None, steps: vec![], end: 0.0, notes: String::new() };
+        let deck = evj_core::slides::SlideDeck { title: "T".into(), source: "t.pdf".into(), width: 64, height: 36, slides: vec![slide("slide001.png"), slide("slide002.jpg")] };
+        deck.save(&dir).unwrap();
+        let gpu = Gpu::new(DeviceKind::Warp).unwrap();
+        let blitter = Blitter::new(&gpu).unwrap();
+        let (info, px) = make(&gpu, &blitter, &dir.join("deck.json")).expect("a thumbnail");
+        assert_eq!(info.duration, 0.0);
+        let mid = ((H / 2 * W + W / 2) * 4) as usize;
+        assert!(px[mid] > 200 && px[mid + 2] < 60, "the red first slide: {:?}", &px[mid..mid + 4]);
+    }
+
+    fn info() -> ClipInfo {
+        ClipInfo { kind: DecoderKind::MediaFoundation, width: 3840, height: 2160, fps: 25.0, frame_count: None, bt709: true, duration: 269.5, random_access: false, has_audio: true }
+    }
+
+    #[test]
+    fn a_thumbnail_is_kept_on_disk_until_its_file_changes() {
+        let dir = std::env::temp_dir().join(format!("evj-thumbcache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let media = dir.join("clip.mp4");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&media, b"first").unwrap();
+        let px: Vec<u8> = (0..W * H * 4).map(|i| (i % 251) as u8).collect();
+        assert!(cache_load(&dir, &media).is_none(), "nothing yet");
+        cache_save(&dir, &media, &info(), &px);
+        let (back, got) = cache_load(&dir, &media).expect("cached");
+        assert_eq!(got, px);
+        assert_eq!((back.kind, back.width, back.height, back.frame_count, back.bt709, back.random_access, back.has_audio), (DecoderKind::MediaFoundation, 3840, 2160, None, true, false, true));
+        assert!((back.fps - 25.0).abs() < 1e-9 && (back.duration - 269.5).abs() < 1e-9);
+        std::fs::write(&media, b"second, longer").unwrap();
+        assert!(cache_load(&dir, &media).is_none(), "a changed file is thumbnailed again");
+        assert!(cache_load(&dir, &dir.join("missing.mp4")).is_none());
     }
 }

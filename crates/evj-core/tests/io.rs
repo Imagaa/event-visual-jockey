@@ -90,7 +90,7 @@ fn materi_decks_are_saved_relative_and_relinked() {
     let back = load(&dir.join("show.vjproj")).unwrap();
     assert_eq!(back.materi[0].deck, deck);
     assert_eq!(back.materi[0].title, "Sambutan");
-    assert_eq!(back.presentation_layer(), 3, "default: the top layer");
+    assert_eq!(back.presentation_layer(), 0, "default: the top layer (Layer 1)");
 }
 
 #[test]
